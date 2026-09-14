@@ -1,0 +1,14 @@
+{
+  "name": "motsuyoku-sensor-core",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Core (UI-independent) logic for the 物欲センサー Blood Gem draw simulator. Pure JS, tested with node:test.",
+  "main": "./src/index.js",
+  "exports": {
+    ".": "./src/index.js"
+  },
+  "scripts": {
+    "test": "node --test test/"
+  }
+}

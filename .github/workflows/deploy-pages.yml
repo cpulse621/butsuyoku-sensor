@@ -1,0 +1,65 @@
+name: Deploy Web MVP to GitHub Pages
+
+# main branchへのpushをトリガーに、
+#   1. Core test (app/core, Phase 1 Freeze後もデプロイ前の回帰確認として毎回実行)
+#   2. Web TypeScript check / Vite production build
+#   3. GitHub Pages deploy
+# の順で実行する。1または2が失敗した場合、3(デプロイ)は実行されない。
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  test-and-build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies (npm workspaces)
+        run: npm ci
+
+      # Coreはfreeze済みだが、デプロイ前の回帰確認として毎回実行する。
+      # 実test()35件がすべてpassすることを条件とし、
+      # (fixtureファイルをNodeが自動探索で1件として数える)36/36表示に合わせる必要はない。
+      - name: Core test (app/core, 35 tests)
+        run: node --test app/core/test/*.test.js
+
+      - name: Web TypeScript check / Vite production build
+        run: npm run build --workspace app/web
+        env:
+          # base pathをこのrepository名に自動対応させる(ハードコード禁止の指示に対応)。
+          # repository名を変更した場合もこの行を変える必要はない。
+          GITHUB_PAGES_BASE: ${{ github.event.repository.name }}
+
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: app/web/dist
+
+  deploy:
+    needs: test-and-build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4

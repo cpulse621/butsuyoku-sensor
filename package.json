@@ -1,0 +1,8 @@
+{
+  "name": "motsuyoku-sensor",
+  "private": true,
+  "workspaces": [
+    "app/core",
+    "app/web"
+  ]
+}
