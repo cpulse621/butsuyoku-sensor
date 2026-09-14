@@ -1,5 +1,5 @@
 import type { GemDataset, ResearchTargetCatalogEntry } from "motsuyoku-sensor-core";
-import { humanizeId } from "../lib/format";
+import { effectLabel } from "../i18n/labels";
 import { RankMultiSelect } from "./RankMultiSelect";
 
 interface Props {
@@ -50,7 +50,7 @@ export function EffectSlotEditor({
             title={entry.exactValueSelectable ? "数値検証済みの値あり" : "数値未検証（effectId一致のみで選択可）"}
             onClick={() => onSelectEffect(entry.effectId)}
           >
-            {humanizeId(entry.effectId)}
+            {effectLabel(entry.effectId)}
             {!entry.exactValueSelectable && <span className="chip-badge">未検証</span>}
           </button>
         ))}

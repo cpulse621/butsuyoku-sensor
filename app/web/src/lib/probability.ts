@@ -14,3 +14,12 @@ export function safeComputeProbability(dataset: GemDataset, target: TargetBloodG
     return { status: "error", message: err instanceof Error ? err.message : String(err) };
   }
 }
+
+// P(X <= rollCount) = 1 - (1-p)^rollCount
+// ProbabilityEngineが返したp(独立試行前提)から算出する補助統計。
+// DrawEngine/ProbabilityEngineの抽選ロジック自体を再実装するものではない。
+export function cumulativeMatchProbability(p: number, rollCount: number): number {
+  if (p <= 0 || rollCount <= 0) return 0;
+  if (p >= 1) return 1;
+  return 1 - Math.pow(1 - p, rollCount);
+}

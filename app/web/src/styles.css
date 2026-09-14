@@ -461,3 +461,202 @@ body {
   opacity: 0.5;
   cursor: not-allowed;
 }
+
+.secondary-button {
+  background: var(--md-surface-container-high);
+  color: var(--md-on-surface);
+  border: 1px solid var(--md-outline);
+  border-radius: 999px;
+  padding: 10px 22px;
+  font-size: 0.85rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.secondary-button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.modal-panel__footer {
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.recording-status-bar__dot--idle {
+  color: var(--md-on-surface-variant);
+}
+
+/* --- モード切替タブ --- */
+
+.mode-tabs {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 16px;
+}
+
+.mode-tab {
+  padding: 10px 20px;
+  border-radius: 999px 999px 0 0;
+  border: 1px solid var(--md-outline);
+  border-bottom: none;
+  background: var(--md-surface-container);
+  color: var(--md-on-surface);
+  font-size: 0.9rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.mode-tab--active {
+  background: var(--md-primary);
+  border-color: var(--md-primary);
+  color: white;
+}
+
+.app-layout--single {
+  grid-template-columns: 1fr;
+  max-width: 560px;
+}
+
+/* --- 1〜5評価入力(欲しさ評価・事後アンケート共通) --- */
+
+.score-selector {
+  margin: 10px 0 16px;
+}
+
+.score-selector__row {
+  display: flex;
+  gap: 8px;
+}
+
+.score-button {
+  flex: 1;
+  min-height: 44px;
+  border-radius: 12px;
+  border: 1px solid var(--md-outline);
+  background: var(--md-surface);
+  font-size: 1rem;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.score-button--selected {
+  background: var(--md-primary);
+  border-color: var(--md-primary);
+  color: white;
+}
+
+.score-selector__captions {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.72rem;
+  color: var(--md-on-surface-variant);
+  margin-top: 6px;
+}
+
+.survey-question {
+  margin-bottom: 18px;
+}
+
+.survey-question__text {
+  font-weight: 600;
+  margin: 0 0 4px;
+}
+
+/* --- 研究モード: 実験中の1件ずつ開示 --- */
+
+.reveal-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin: 14px 0;
+  max-height: 320px;
+  overflow-y: auto;
+}
+
+.reveal-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  align-items: center;
+  background: var(--md-surface);
+  border: 1px solid var(--md-surface-container-high);
+  border-radius: 10px;
+  padding: 8px 12px;
+  font-size: 0.78rem;
+}
+
+.reveal-row--match {
+  border-color: var(--md-success);
+  background: var(--md-success-container);
+}
+
+.reveal-row__index {
+  font-weight: 700;
+  color: var(--md-on-surface-variant);
+}
+
+.reveal-row__badge {
+  margin-left: auto;
+  font-weight: 700;
+  color: var(--md-success);
+}
+
+/* --- 研究モード: 結果画面 --- */
+
+.result-status {
+  margin-bottom: 12px;
+}
+
+.result-status__badge {
+  display: inline-block;
+  border-radius: 999px;
+  padding: 6px 16px;
+  font-weight: 700;
+  font-size: 0.85rem;
+}
+
+.result-status__badge--success {
+  background: var(--md-success-container);
+  color: var(--md-success);
+}
+
+.result-status__badge--censored {
+  background: var(--md-surface-container-high);
+  color: var(--md-on-surface-variant);
+}
+
+/* --- レスポンシブ: スマートフォン幅での操作性を優先 --- */
+
+@media (max-width: 480px) {
+  .pull-grid {
+    grid-template-columns: 1fr;
+  }
+}
+
+@media (max-width: 600px) {
+  .app-shell {
+    padding: 16px 12px 48px;
+  }
+
+  .primary-button,
+  .danger-button,
+  .secondary-button {
+    min-height: 44px;
+    width: 100%;
+  }
+
+  .pull-controls {
+    flex-direction: column;
+    align-items: stretch;
+  }
+
+  .chip {
+    min-height: 40px;
+    padding: 8px 14px;
+  }
+
+  .score-button {
+    min-height: 48px;
+  }
+}

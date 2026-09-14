@@ -7,13 +7,14 @@
 //   そのまま送信ペイロードの元にできるようにし、UI側のコード変更を最小化する。
 //   今回は外部送信は一切行わない(localStorageのみ)。
 // - 保存keyにバージョンサフィックスを付け、将来のスキーマ変更時に旧データと衝突しないようにする。
+// - 血晶マラソンは数万〜数十万drawに達しうるため、個々のdraw結果は保存しない。
+//   長期保存するのは「session要約(合計試行数・バッチ数・一致数)」のみとする。
+//   直近の10連結果(表示用)はReact state側で保持し、ここには一切渡さない。
 
 const STORAGE_KEY = "motsuyoku_sensor_simulation_history_v1";
 
-// 端末内の記録が際限なく肥大化しないための上限。
-// 通常の実験・検証用途であれば十分な件数であり、超過分は古いものから間引く。
-const MAX_SESSIONS = 30;
-const MAX_DRAWS_PER_SESSION = 2000; // 1session あたり最大200回の「10連」相当
+// 端末内の記録が際限なく肥大化しないための上限。要約のみの保存のため十分小さく収まる。
+const MAX_SESSIONS = 200;
 
 export interface StoredTarget {
   shape: string[];
@@ -22,20 +23,6 @@ export interface StoredTarget {
   secondary_effect_id: string | null;
   secondary_allowed_ranks: number[] | null;
   accepted_curse_ids: string[];
-}
-
-export interface StoredDraw {
-  sequence_number: number;
-  shape: string;
-  primary_effect_id: string;
-  primary_rank: number;
-  primary_value: number | null;
-  secondary_effect_id: string | null;
-  secondary_rank: number | null;
-  secondary_value: number | null;
-  curse_id: string;
-  // TargetMatcher(isMatch)の結果をそのまま保存したもの。ここでは一切再計算しない。
-  matched: boolean;
 }
 
 export interface SimulationSession {
@@ -51,21 +38,11 @@ export interface SimulationSession {
   total_draws: number;
   batch_count: number;
   match_count: number;
-  draws: StoredDraw[];
 }
 
 export interface StorageResult {
   ok: boolean;
   error?: string;
-}
-
-export interface SessionSummary {
-  session_id: string;
-  started_at: string;
-  enemy_display_name: string;
-  target_summary: string;
-  total_draws: number;
-  match_count: number;
 }
 
 function readAll(): SimulationSession[] {
@@ -120,26 +97,21 @@ export function createSession(params: {
     total_draws: 0,
     batch_count: 0,
     match_count: 0,
-    draws: [],
   };
   sessions.push(session);
   while (sessions.length > MAX_SESSIONS) sessions.shift();
   return writeAll(sessions);
 }
 
-// 「10回抽選」1回分(=1バッチ)の記録を追加する。sequence_numberはsession内通算番号。
-export function appendDraws(sessionId: string, draws: StoredDraw[]): StorageResult {
+// 「10回抽選」1回分(=1バッチ)の要約(件数・一致数)だけを積算する。個々のdrawは保存しない。
+export function recordBatchSummary(sessionId: string, batchSize: number, matchCount: number): StorageResult {
   const sessions = readAll();
   const session = sessions.find((s) => s.session_id === sessionId);
   if (!session) return { ok: false, error: `session "${sessionId}" が見つかりません` };
 
-  session.draws.push(...draws);
-  if (session.draws.length > MAX_DRAWS_PER_SESSION) {
-    session.draws = session.draws.slice(-MAX_DRAWS_PER_SESSION);
-  }
-  session.total_draws += draws.length;
+  session.total_draws += batchSize;
   session.batch_count += 1;
-  session.match_count += draws.filter((d) => d.matched).length;
+  session.match_count += matchCount;
   session.updated_at = new Date().toISOString();
 
   return writeAll(sessions);
@@ -149,18 +121,8 @@ export function getSession(sessionId: string): SimulationSession | null {
   return readAll().find((s) => s.session_id === sessionId) ?? null;
 }
 
-export function listSessionSummaries(): SessionSummary[] {
-  return readAll()
-    .slice()
-    .reverse() // 新しいsessionを先頭に
-    .map((s) => ({
-      session_id: s.session_id,
-      started_at: s.started_at,
-      enemy_display_name: s.enemy_display_name,
-      target_summary: s.target_summary,
-      total_draws: s.total_draws,
-      match_count: s.match_count,
-    }));
+export function listSessions(): SimulationSession[] {
+  return readAll().slice().reverse(); // 新しいsessionを先頭に
 }
 
 export function deleteAllHistory(): StorageResult {
@@ -170,4 +132,60 @@ export function deleteAllHistory(): StorageResult {
   } catch (err) {
     return { ok: false, error: err instanceof Error ? err.message : String(err) };
   }
+}
+
+export function exportSessionsAsJSON(): string {
+  return JSON.stringify(listSessions(), null, 2);
+}
+
+function csvEscape(value: string | number | null): string {
+  const s = value === null ? "" : String(value);
+  if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+  return s;
+}
+
+const CSV_HEADERS = [
+  "session_id",
+  "started_at",
+  "updated_at",
+  "enemy_id",
+  "enemy_display_name",
+  "dataset_id",
+  "target_shape",
+  "target_primary_effect_id",
+  "target_primary_allowed_ranks",
+  "target_secondary_effect_id",
+  "target_secondary_allowed_ranks",
+  "target_accepted_curse_ids",
+  "theoretical_probability",
+  "total_draws",
+  "batch_count",
+  "match_count",
+];
+
+// 1 session = 1 row。Google Sheetsへそのままimportしやすい形式。
+export function exportSessionsAsCSV(): string {
+  const rows = listSessions().map((s) =>
+    [
+      s.session_id,
+      s.started_at,
+      s.updated_at,
+      s.enemy_id,
+      s.enemy_display_name,
+      s.dataset_id,
+      s.target.shape.join(";"),
+      s.target.primary_effect_id,
+      s.target.primary_allowed_ranks.join(";"),
+      s.target.secondary_effect_id ?? "",
+      s.target.secondary_allowed_ranks?.join(";") ?? "",
+      s.target.accepted_curse_ids.join(";"),
+      s.theoretical_probability ?? "",
+      s.total_draws,
+      s.batch_count,
+      s.match_count,
+    ]
+      .map(csvEscape)
+      .join(",")
+  );
+  return [CSV_HEADERS.join(","), ...rows].join("\n");
 }

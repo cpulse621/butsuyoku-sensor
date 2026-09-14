@@ -1,5 +1,5 @@
 import type { CursePoolEntry } from "motsuyoku-sensor-core";
-import { humanizeId } from "../lib/format";
+import { curseLabel } from "../i18n/labels";
 
 interface Props {
   allCurses: CursePoolEntry[];
@@ -41,7 +41,7 @@ export function CursePicker({ allCurses, eligibleCurseIds, primarySelected, sele
               title={!eligible && primarySelected ? "現在の1op/2opの組み合わせでは成立しません" : undefined}
               onClick={() => onToggle(curse.curseId)}
             >
-              {humanizeId(curse.curseId)}
+              {curseLabel(curse.curseId)}
             </button>
           );
         })}

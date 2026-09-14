@@ -1,6 +1,7 @@
 import type { BloodGem, GemDataset, TargetBloodGem } from "motsuyoku-sensor-core";
 import { isMatch } from "motsuyoku-sensor-core";
-import { formatEffectValue, humanizeId } from "../lib/format";
+import { formatEffectValue } from "../lib/format";
+import { curseLabel, effectLabel, matchStatusLabel, shapeLabel } from "../i18n/labels";
 
 interface Props {
   dataset: GemDataset;
@@ -37,18 +38,18 @@ export function DrawResultsGrid({ dataset, gems, target }: Props) {
           return (
             <div key={i} className={`pull-cell ${matched ? "pull-cell--match" : ""}`}>
               <div className="pull-cell__index">#{i + 1}</div>
-              <div className="pull-cell__row">{humanizeId(gem.shapeId)}</div>
+              <div className="pull-cell__row">{shapeLabel(gem.shapeId)}</div>
               <div className="pull-cell__row">
-                {humanizeId(gem.primaryEffectId)} {primaryValue.text}
+                {effectLabel(gem.primaryEffectId)} {primaryValue.text}
               </div>
               {hasSecondary && (
                 <div className="pull-cell__row">
-                  {gem.secondaryEffectId ? `${humanizeId(gem.secondaryEffectId)} ${secondaryValue?.text ?? ""}` : "—"}
+                  {gem.secondaryEffectId ? `${effectLabel(gem.secondaryEffectId)} ${secondaryValue?.text ?? ""}` : "—"}
                 </div>
               )}
-              <div className="pull-cell__row">呪い: {humanizeId(gem.curseId)}</div>
+              <div className="pull-cell__row">呪い: {curseLabel(gem.curseId)}</div>
               <div className={`pull-cell__badge ${matched ? "pull-cell__badge--match" : matched === false ? "pull-cell__badge--miss" : ""}`}>
-                {matched === null ? "Target未設定" : matched ? "TARGET MATCH" : "MISS"}
+                {matched === null ? "Target未設定" : matchStatusLabel(matched)}
               </div>
             </div>
           );

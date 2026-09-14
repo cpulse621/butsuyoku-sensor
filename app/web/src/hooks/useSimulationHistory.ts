@@ -1,8 +1,8 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { BloodGem, GemDataset, TargetBloodGem } from "motsuyoku-sensor-core";
-import { isMatch, lookupDisplayValue } from "motsuyoku-sensor-core";
+import { isMatch } from "motsuyoku-sensor-core";
 import * as historyStore from "../storage/simulationHistory";
-import type { StoredDraw, StoredTarget } from "../storage/simulationHistory";
+import { toStoredTarget, summarizeTarget } from "../lib/targetSummary";
 
 // Target(および敵/dataset)の内容が変わったかどうかを判定するための署名。
 // 「異なるTargetのdrawを既存sessionへ混在させない」ための唯一の判定材料にする。
@@ -18,29 +18,13 @@ function targetSignature(datasetId: string, target: TargetBloodGem): string {
   });
 }
 
-function toStoredTarget(target: TargetBloodGem): StoredTarget {
-  return {
-    shape: target.acceptedShapes,
-    primary_effect_id: target.primaryEffectId,
-    primary_allowed_ranks: target.acceptedPrimaryRanks,
-    secondary_effect_id: target.secondaryEffectId ?? null,
-    secondary_allowed_ranks: target.acceptedSecondaryRanks ?? null,
-    accepted_curse_ids: target.acceptedCurses,
-  };
-}
-
-function summarizeTarget(target: TargetBloodGem): string {
-  const parts = [target.primaryEffectId];
-  if (target.secondaryEffectId) parts.push(`2op:${target.secondaryEffectId}`);
-  parts.push(`curse:${target.acceptedCurses.length}種`);
-  return parts.join(" / ");
-}
-
 // ブラウザlocalStorageへの記録機能。保存処理自体はstorage/simulationHistory.tsに隔離し、
 // このhookはReact向けの薄いオーケストレーション(いつ新sessionを作るか/表示用stateの更新)のみを担う。
+// 個々のdraw結果はここでは保存しない(session要約のみをstorageへ渡す)。
 export function useSimulationHistory(dataset: GemDataset, target: TargetBloodGem | null, theoreticalProbability: number | null) {
   const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
   const [sessionTotalDraws, setSessionTotalDraws] = useState(0);
+  const [sessionMatchCount, setSessionMatchCount] = useState(0);
   const [lastError, setLastError] = useState<string | null>(null);
   const signatureRef = useRef<string | null>(null);
 
@@ -53,6 +37,7 @@ export function useSimulationHistory(dataset: GemDataset, target: TargetBloodGem
       signatureRef.current = targetSig;
       setCurrentSessionId(null);
       setSessionTotalDraws(0);
+      setSessionMatchCount(0);
     }
   }, [targetSig]);
 
@@ -79,36 +64,15 @@ export function useSimulationHistory(dataset: GemDataset, target: TargetBloodGem
         setCurrentSessionId(sessionId);
       }
 
-      const existing = historyStore.getSession(sessionId);
-      const baseSeq = existing?.total_draws ?? 0;
-
-      const storedDraws: StoredDraw[] = gems.map((gem, i) => {
-        const primaryValue = lookupDisplayValue(dataset, "primary", gem.primaryEffectId, gem.primaryValueRank).value;
-        const secondaryValue =
-          gem.secondaryEffectId !== null && gem.secondaryValueRank !== null
-            ? lookupDisplayValue(dataset, "secondary", gem.secondaryEffectId, gem.secondaryValueRank).value
-            : null;
-        return {
-          sequence_number: baseSeq + i + 1,
-          shape: gem.shapeId,
-          primary_effect_id: gem.primaryEffectId,
-          primary_rank: gem.primaryValueRank,
-          primary_value: primaryValue,
-          secondary_effect_id: gem.secondaryEffectId,
-          secondary_rank: gem.secondaryValueRank,
-          secondary_value: secondaryValue,
-          curse_id: gem.curseId,
-          matched: isMatch(gem, target), // TargetMatcherの結果をそのまま保存(再計算しない)
-        };
-      });
-
-      const appended = historyStore.appendDraws(sessionId, storedDraws);
-      if (!appended.ok) {
-        setLastError(appended.error ?? "記録できませんでした");
+      const matchCount = gems.filter((gem) => isMatch(gem, target)).length; // TargetMatcherの結果をそのまま集計(再計算しない)
+      const result = historyStore.recordBatchSummary(sessionId, gems.length, matchCount);
+      if (!result.ok) {
+        setLastError(result.error ?? "記録できませんでした");
         return;
       }
       setLastError(null);
-      setSessionTotalDraws(baseSeq + storedDraws.length);
+      setSessionTotalDraws((n) => n + gems.length);
+      setSessionMatchCount((n) => n + matchCount);
     },
     [dataset, target, theoreticalProbability, currentSessionId]
   );
@@ -118,16 +82,20 @@ export function useSimulationHistory(dataset: GemDataset, target: TargetBloodGem
     if (result.ok) {
       setCurrentSessionId(null);
       setSessionTotalDraws(0);
+      setSessionMatchCount(0);
     }
     return result;
   }, []);
 
   return {
     sessionTotalDraws,
+    sessionMatchCount,
     lastError,
     recordBatch,
     clearHistory,
-    listSessionSummaries: historyStore.listSessionSummaries,
+    listSessions: historyStore.listSessions,
+    exportJSON: historyStore.exportSessionsAsJSON,
+    exportCSV: historyStore.exportSessionsAsCSV,
   };
 }
 

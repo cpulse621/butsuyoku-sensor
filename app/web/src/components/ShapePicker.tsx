@@ -1,5 +1,5 @@
 import type { GemDataset } from "motsuyoku-sensor-core";
-import { humanizeId } from "../lib/format";
+import { shapeLabel } from "../i18n/labels";
 
 interface Props {
   dataset: GemDataset;
@@ -32,7 +32,7 @@ export function ShapePicker({ dataset, selected, onToggle, onSetAll }: Props) {
             aria-pressed={selected.includes(entry.shapeId)}
             onClick={() => onToggle(entry.shapeId)}
           >
-            {humanizeId(entry.shapeId)}
+            {shapeLabel(entry.shapeId)}
           </button>
         ))}
       </div>

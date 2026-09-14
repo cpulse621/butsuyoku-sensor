@@ -1,5 +1,5 @@
 import type { GemDataset, ResearchTargetCatalogEntry } from "motsuyoku-sensor-core";
-import { humanizeId } from "../lib/format";
+import { effectLabel } from "../i18n/labels";
 import { RankMultiSelect } from "./RankMultiSelect";
 
 interface Props {
@@ -19,7 +19,7 @@ export function FixedSecondaryEditor({ dataset, catalogEntry, effectId, selected
     <div className="card">
       <h3 className="section-title">2op（Secondary Effect）</h3>
       <div className="fixed-effect-display">
-        <span className="chip chip--selected chip--readonly">{humanizeId(effectId)}</span>
+        <span className="chip chip--selected chip--readonly">{effectLabel(effectId)}</span>
         <span className="hint">固定（種類抽選なし）</span>
       </div>
       <div className="rank-section">

@@ -219,6 +219,47 @@ declare module "motsuyoku-sensor-core" {
     REVEALED: "revealed";
   };
 
+  export interface ResearchModeRevealResult {
+    gem: BloodGem;
+    rollCount: number;
+    matched: boolean;
+  }
+
+  export interface ResearchModeSurveyAnswers {
+    tediousnessScore: 1 | 2 | 3 | 4 | 5;
+    painIfRepeatedScore: 1 | 2 | 3 | 4 | 5;
+    sensorScore: 1 | 2 | 3 | 4 | 5;
+  }
+
+  export interface ResearchModeSummary {
+    datasetId: string;
+    target: TargetBloodGem;
+    desireScore: 1 | 2 | 3 | 4 | 5;
+    phase: "setup" | "running" | "awaiting_survey" | "revealed";
+    rollCount: number;
+    matched: boolean;
+    matchedAt: number | null;
+    censored: boolean;
+    survey: ResearchModeSurveyAnswers | null;
+    startedAt: number | null;
+    finishedAt: number | null;
+  }
+
+  export function createResearchModeSession(args: {
+    dataset: GemDataset;
+    target: TargetBloodGem;
+    desireScore: 1 | 2 | 3 | 4 | 5;
+    rng?: Rng;
+  }): {
+    start(): void;
+    revealNext(): ResearchModeRevealResult;
+    giveUp(): void;
+    submitSurvey(answers: ResearchModeSurveyAnswers): void;
+    getTheoreticalProbability(): ProbabilityResult;
+    getSummary(): ResearchModeSummary;
+    readonly phase: "setup" | "running" | "awaiting_survey" | "revealed";
+  };
+
   export function createSimulatorModeSession(args: { dataset: GemDataset; target: TargetBloodGem | null; rng?: Rng }): {
     pullTen(): BloodGem[];
     getProbabilityInfo(): ProbabilityResult | null;
