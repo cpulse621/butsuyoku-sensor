@@ -2,9 +2,10 @@ name: Deploy Web MVP to GitHub Pages
 
 # main branchへのpushをトリガーに、
 #   1. Core test (app/core, Phase 1 Freeze後もデプロイ前の回帰確認として毎回実行)
-#   2. Web TypeScript check / Vite production build
-#   3. GitHub Pages deploy
-# の順で実行する。1または2が失敗した場合、3(デプロイ)は実行されない。
+#   2. Web test (app/web, Vitest)
+#   3. Web TypeScript check / Vite production build
+#   4. GitHub Pages deploy
+# の順で実行する。1〜3のいずれかが失敗した場合、4(デプロイ)は実行されない。
 on:
   push:
     branches: [main]
@@ -40,6 +41,9 @@ jobs:
       # (fixtureファイルをNodeが自動探索で1件として数える)36/36表示に合わせる必要はない。
       - name: Core test (app/core, 35 tests)
         run: node --test app/core/test/*.test.js
+
+      - name: Web test (app/web, Vitest)
+        run: npm test --workspace app/web
 
       - name: Web TypeScript check / Vite production build
         run: npm run build --workspace app/web
