@@ -1,7 +1,9 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import type { BloodGem, GemDataset } from "motsuyoku-sensor-core";
 import { EvilSpiritDataset, MadmanDataset, WatchersDataset, draw } from "motsuyoku-sensor-core";
 import { useTargetDraft } from "./hooks/useTargetDraft";
+import { useSimulationHistory } from "./hooks/useSimulationHistory";
+import { safeComputeProbability } from "./lib/probability";
 import { EnemyTabs } from "./components/EnemyTabs";
 import { ShapePicker } from "./components/ShapePicker";
 import { EffectSlotEditor } from "./components/EffectSlotEditor";
@@ -9,6 +11,8 @@ import { FixedSecondaryEditor } from "./components/FixedSecondaryEditor";
 import { CursePicker } from "./components/CursePicker";
 import { ProbabilityPanel } from "./components/ProbabilityPanel";
 import { DrawResultsGrid } from "./components/DrawResultsGrid";
+import { RecordingStatusBar } from "./components/RecordingStatusBar";
+import { HistoryPanel } from "./components/HistoryPanel";
 
 const DATASETS: GemDataset[] = [WatchersDataset, MadmanDataset, EvilSpiritDataset];
 
@@ -17,6 +21,7 @@ export default function App() {
   const [pullGems, setPullGems] = useState<BloodGem[]>([]);
   const [pullBatchCount, setPullBatchCount] = useState(0);
   const [pullError, setPullError] = useState<string | null>(null);
+  const [historyOpen, setHistoryOpen] = useState(false);
 
   const {
     draft,
@@ -34,6 +39,15 @@ export default function App() {
     setAllCurses,
   } = useTargetDraft(dataset);
 
+  const probabilityOutcome = useMemo(() => safeComputeProbability(dataset, target), [dataset, target]);
+  const theoreticalProbability = probabilityOutcome.status === "ok" ? probabilityOutcome.result.p : null;
+
+  const { sessionTotalDraws, lastError: recordingError, recordBatch, clearHistory, listSessionSummaries } = useSimulationHistory(
+    dataset,
+    target,
+    theoreticalProbability
+  );
+
   // 敵を切り替えたら、10連結果もリセットする(別データセットの結果を混在させない)。
   useEffect(() => {
     setPullGems([]);
@@ -47,6 +61,7 @@ export default function App() {
       setPullGems(gems);
       setPullBatchCount((c) => c + 1);
       setPullError(null);
+      recordBatch(gems); // localStorageへ記録(storage/simulationHistory.ts経由。Target未設定時は内部で何もしない)
     } catch (err) {
       setPullError(err instanceof Error ? err.message : String(err));
     }
@@ -115,6 +130,8 @@ export default function App() {
         </section>
 
         <section className="app-layout__right">
+          <RecordingStatusBar sessionTotalDraws={sessionTotalDraws} lastError={recordingError} onOpenHistory={() => setHistoryOpen(true)} />
+
           <ProbabilityPanel dataset={dataset} target={target} />
 
           <div className="card pull-controls">
@@ -132,6 +149,13 @@ export default function App() {
           <DrawResultsGrid dataset={dataset} gems={pullGems} target={target} />
         </section>
       </main>
+
+      <HistoryPanel
+        open={historyOpen}
+        onClose={() => setHistoryOpen(false)}
+        listSessionSummaries={listSessionSummaries}
+        onDeleteAll={clearHistory}
+      />
     </div>
   );
 }

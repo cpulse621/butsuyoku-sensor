@@ -1,7 +1,7 @@
 import { useMemo } from "react";
 import type { GemDataset, TargetBloodGem } from "motsuyoku-sensor-core";
-import { computeProbability } from "motsuyoku-sensor-core";
 import { formatOneInN, formatProbability, humanizeId } from "../lib/format";
+import { safeComputeProbability } from "../lib/probability";
 
 interface Props {
   dataset: GemDataset;
@@ -20,15 +20,7 @@ const BREAKDOWN_LABELS: Record<string, string> = {
 // 出現確率の計算はTargetMatcherではなくCoreのProbabilityEngine(computeProbability)のみを使う。
 // ここでは確率の再計算は一切行わず、Coreの戻り値をそのまま整形して表示するだけ。
 export function ProbabilityPanel({ dataset, target }: Props) {
-  const outcome = useMemo(() => {
-    if (!target) return { status: "no-target" as const };
-    try {
-      const result = computeProbability(dataset, target);
-      return { status: "ok" as const, result };
-    } catch (err) {
-      return { status: "error" as const, message: err instanceof Error ? err.message : String(err) };
-    }
-  }, [dataset, target]);
+  const outcome = useMemo(() => safeComputeProbability(dataset, target), [dataset, target]);
 
   return (
     <div className="card probability-panel">
