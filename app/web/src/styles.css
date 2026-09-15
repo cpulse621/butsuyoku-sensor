@@ -563,15 +563,14 @@ body {
   margin: 0 0 4px;
 }
 
-/* --- 研究モード: 実験中の1件ずつ開示 --- */
+/* --- 研究モード: 実験中の1件ずつ開示(縦積みリスト) ---
+   スクロールは親の.research-run-shell__resultsが単独で担当するため、
+   ここでは自前のmax-height/overflowは持たせない(二重スクロール防止)。 */
 
 .reveal-list {
   display: flex;
   flex-direction: column;
-  gap: 6px;
-  margin: 14px 0;
-  max-height: 320px;
-  overflow-y: auto;
+  gap: 8px;
 }
 
 .reveal-row {
@@ -581,9 +580,10 @@ body {
   align-items: center;
   background: var(--md-surface);
   border: 1px solid var(--md-surface-container-high);
-  border-radius: 10px;
-  padding: 8px 12px;
-  font-size: 0.78rem;
+  border-radius: 12px;
+  padding: 10px 14px;
+  font-size: 0.82rem;
+  scroll-margin-block-end: 8px; /* scrollIntoViewが端でぴったり止まりすぎないように余白を確保 */
 }
 
 .reveal-row--match {
@@ -594,12 +594,20 @@ body {
 .reveal-row__index {
   font-weight: 700;
   color: var(--md-on-surface-variant);
+  min-width: 3.5em;
 }
 
 .reveal-row__badge {
   margin-left: auto;
   font-weight: 700;
+}
+
+.reveal-row__badge--match {
   color: var(--md-success);
+}
+
+.reveal-row__badge--miss {
+  color: var(--md-on-surface-variant);
 }
 
 /* --- 研究モード: 結果画面 --- */

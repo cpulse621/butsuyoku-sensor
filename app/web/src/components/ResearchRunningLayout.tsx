@@ -1,7 +1,7 @@
 import type { GemDataset, TargetBloodGem } from "motsuyoku-sensor-core";
 import type { RevealedEntry } from "../hooks/useResearchSession";
 import { effectLabel, shapeLabel, curseLabel } from "../i18n/labels";
-import { ResearchRevealGrid } from "./ResearchRevealGrid";
+import { ResearchRevealList } from "./ResearchRevealList";
 import { AutoAdvanceControl } from "./AutoAdvanceControl";
 
 interface Props {
@@ -75,7 +75,7 @@ export function ResearchRunningLayout({
 
       <div className="research-run-shell__body">
         <div className="research-run-shell__results">
-          <ResearchRevealGrid dataset={dataset} revealed={currentBatchRevealed} />
+          <ResearchRevealList dataset={dataset} revealed={currentBatchRevealed} />
         </div>
 
         <div className="research-run-shell__sidebar">
@@ -126,7 +126,9 @@ export function ResearchRunningLayout({
             disabled={isRevealing}
           />
         )}
-        <button type="button" className="danger-button" onClick={handleGiveUpClick} disabled={isRevealing}>
+        {/* 結果を順次表示している最中でも「実験を終了する」は使えるままにする(指示#8)。
+            押した瞬間、hook側(giveUp)が表示中のrevealBatchループへ即座に停止を伝える。 */}
+        <button type="button" className="danger-button" onClick={handleGiveUpClick}>
           実験を終了する
         </button>
       </div>

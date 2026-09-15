@@ -10,8 +10,22 @@ import { attemptSubmission, isSubmissionConfigured } from "../services/researchS
 // (Coreは変更していないため、ここは既知の実値であり創作ではない)。
 const ENGINE_VERSION = "motsuyoku-sensor-core@0.1.0";
 
-// auto条件での固定間隔。研究中はUIから変更できない(指示: 速度変更は研究中には不可)。
-export const AUTO_INTERVAL_MS = 10000;
+// 1件あたりの結果表示間隔。派手なガチャ演出ではなく「個々の結果(特に外れ)を
+// 参加者が認識できること」が目的のため、控えめな値を定数として分離しておく。
+export const REVEAL_ITEM_DELAY_MS = 400;
+
+// auto条件の間隔(ms)。「その10連の結果をすべて表示し終えてから次の10連まで」の待ち時間。
+// 実験開始時に1回だけこの範囲でランダムに決め、その実験中は固定する
+// (auto_interval_msを1つの値としてそのまま記録できるようにするため。研究中の速度変更は不可)。
+export const AUTO_INTERVAL_MIN_MS = 3000;
+export const AUTO_INTERVAL_MAX_MS = 5000;
+
+function pickAutoIntervalMs(): number {
+  return AUTO_INTERVAL_MIN_MS + Math.floor(Math.random() * (AUTO_INTERVAL_MAX_MS - AUTO_INTERVAL_MIN_MS + 1));
+}
+
+// 「前回の実験を再開しました」通知を自動的に消すまでの時間。
+export const RESUME_NOTICE_AUTO_DISMISS_MS = 5000;
 
 export type UiPhase = "idle" | "running" | "awaiting_survey" | "awaiting_exit_reason" | "revealed";
 
@@ -46,6 +60,10 @@ export function useResearchSession() {
   const [rollCount, setRollCount] = useState(0);
   const [currentBatchRevealed, setCurrentBatchRevealed] = useState<RevealedEntry[]>([]);
   const [isRevealing, setIsRevealing] = useState(false);
+  // isRevealingの最新値をrevealBatch冒頭で即座に読むためのref。
+  // (連打で複数のrevealBatchが同時に走り、10件の順次表示を飛ばされることを防ぐ。
+  //  useCallback内のisRevealing state closureはstale化しうるため、refで保証する。)
+  const isRevealingRef = useRef(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [finalRecord, setFinalRecord] = useState<ResearchExperiment | null>(null);
   const finalRecordRef = useRef<ResearchExperiment | null>(null);
@@ -59,7 +77,7 @@ export function useResearchSession() {
 
   // manual/auto(研究条件)
   const [drawAdvanceMode, setDrawAdvanceMode] = useState<DrawAdvanceMode | null>(null);
-  const [autoRemainingMs, setAutoRemainingMs] = useState(AUTO_INTERVAL_MS);
+  const [autoRemainingMs, setAutoRemainingMs] = useState(0);
   const [isAutoPaused, setIsAutoPaused] = useState(false);
   // pauseCount/pausedDurationMsはUIへライブ表示しないため、stateではなくrefで持つ。
   // (finalize/giveUp/submitSurvey等はuseCallback([])で作られ、Reactのstateクロージャが
@@ -79,6 +97,7 @@ export function useResearchSession() {
     startedAtMs: number;
     batchCount: number;
     drawAdvanceMode: DrawAdvanceMode;
+    autoIntervalMs: number | null; // 実験開始時に1回だけ決めた値。実験中は不変。
   } | null>(null);
   const pendingGiveUpRef = useRef(false);
   const pendingSurveyAnswersRef = useRef<SurveyAnswers | null>(null);
@@ -94,6 +113,15 @@ export function useResearchSession() {
     return () => window.clearInterval(id);
   }, [uiPhase]);
 
+  // 「前回の実験を再開しました」通知は一時的な案内のため、表示開始から一定時間で自動的に消す。
+  // 新しい実験開始・実験終了時はbeginSession/finalizeがresumedProgressResetをfalseにするため、
+  // このタイマーのcleanup(clearTimeout)が働き、古いタイマーが誤って発火することもない。
+  useEffect(() => {
+    if (!resumedProgressReset) return;
+    const id = window.setTimeout(() => setResumedProgressReset(false), RESUME_NOTICE_AUTO_DISMISS_MS);
+    return () => window.clearTimeout(id);
+  }, [resumedProgressReset]);
+
   function beginSession(
     dataset: GemDataset,
     target: TargetBloodGem,
@@ -102,16 +130,18 @@ export function useResearchSession() {
     participantId: string,
     startedAtMs: number,
     mode: DrawAdvanceMode,
+    autoIntervalMs: number | null,
     resumed: boolean
   ) {
     const session = createResearchModeSession({ dataset, target, desireScore, rng: createDefaultRng() });
     session.start();
     sessionRef.current = session;
-    metaRef.current = { experimentId, participantId, dataset, target, startedAtMs, batchCount: 0, drawAdvanceMode: mode };
+    metaRef.current = { experimentId, participantId, dataset, target, startedAtMs, batchCount: 0, drawAdvanceMode: mode, autoIntervalMs };
     pendingGiveUpRef.current = false;
     pendingSurveyAnswersRef.current = null;
     pauseStartedAtRef.current = null;
     stopRequestedRef.current = false;
+    isRevealingRef.current = false;
 
     researchStore.saveActiveExperiment({
       experiment_id: experimentId,
@@ -123,17 +153,18 @@ export function useResearchSession() {
       target: toStoredTarget(target),
       desire_score: desireScore,
       draw_advance_mode: mode,
-      auto_interval_ms: mode === "auto" ? AUTO_INTERVAL_MS : null,
+      auto_interval_ms: autoIntervalMs,
     });
 
     setDrawAdvanceMode(mode);
-    setAutoRemainingMs(AUTO_INTERVAL_MS);
+    setAutoRemainingMs(autoIntervalMs ?? 0);
     setIsAutoPaused(false);
     pauseCountRef.current = 0;
     pausedDurationMsRef.current = 0;
     setResumedProgressReset(resumed);
     setRollCount(0);
     setCurrentBatchRevealed([]);
+    setIsRevealing(false);
     setElapsedMs(0);
     setIsRetiring(false);
     setSaveError(null);
@@ -145,7 +176,8 @@ export function useResearchSession() {
     const participantId = researchStore.getOrCreateParticipantId();
     // 参加者には選択させず、実験開始時にランダムへ割り当てる(比較したい要因: 次の10連を自分でクリックするかどうか)。
     const mode: DrawAdvanceMode = Math.random() < 0.5 ? "manual" : "auto";
-    beginSession(dataset, target, desireScore, experimentId, participantId, Date.now(), mode, false);
+    const autoIntervalMs = mode === "auto" ? pickAutoIntervalMs() : null;
+    beginSession(dataset, target, desireScore, experimentId, participantId, Date.now(), mode, autoIntervalMs, false);
   }, []);
 
   // reload後、activeExperimentスナップショットから再開する。
@@ -169,6 +201,7 @@ export function useResearchSession() {
       resumeSnapshot.participant_id,
       new Date(resumeSnapshot.started_at).getTime(),
       resumeSnapshot.draw_advance_mode,
+      resumeSnapshot.auto_interval_ms, // 元の割り当てをそのまま引き継ぐ(再度ランダム化しない)
       true
     );
     setResumeHandled(true);
@@ -180,36 +213,43 @@ export function useResearchSession() {
   }, []);
 
   // 「10回抽選」(manual: ボタン押下 / auto: カウントダウン満了)で呼ばれる。
-  // Core側は内部で10件生成し、最初のMATCHを見つけた位置で以降を開示しない。表示は1件ずつ進める。
+  // Core側は内部で10件生成するが、画面へは1件ずつ(REVEAL_ITEM_DELAY_MS間隔で)提示する。
+  // 「また外れた」を個々に認識できることが目的で、一気に10件出す演出はしない。
+  // isRevealingRef(連打・auto二重発火防止)は、全件の提示が完了するまで次のバッチを一切開始させない。
   const revealBatch = useCallback(async () => {
+    if (isRevealingRef.current) return; // 表示中の連打・二重発火を防ぐ(10件の提示完了まで次を開始しない)
     const session = sessionRef.current;
     if (!session || uiPhase !== "running") return;
     if (metaRef.current) metaRef.current.batchCount += 1;
     stopRequestedRef.current = false;
 
+    isRevealingRef.current = true;
     setIsRevealing(true);
     setCurrentBatchRevealed([]);
     const revealedThisBatch: RevealedEntry[] = [];
 
     for (let i = 0; i < 10; i++) {
-      if (stopRequestedRef.current) break; // 途中終了ボタンが押された
+      if (stopRequestedRef.current) break; // 途中終了ボタンが押された→未表示分は追加表示しない
       if (session.phase !== ResearchModePhases.RUNNING) break;
       const { gem, rollCount: newRollCount, matched } = session.revealNext();
       const entry: RevealedEntry = { gem, rollCount: newRollCount, matched };
       revealedThisBatch.push(entry);
       setCurrentBatchRevealed([...revealedThisBatch]);
       setRollCount(newRollCount);
-      if (matched) break;
+      if (matched) break; // Target Match: ここで停止し、残りは参加者に見せない(roll_countも増やさない)
       // eslint-disable-next-line no-await-in-loop
-      await new Promise((resolve) => window.setTimeout(resolve, 180));
+      await new Promise((resolve) => window.setTimeout(resolve, REVEAL_ITEM_DELAY_MS));
+      if (stopRequestedRef.current) break; // 待機中に途中終了された場合も、直後の1件を出さずに止める
     }
 
+    isRevealingRef.current = false;
     setIsRevealing(false);
     const phaseAfterBatch: string = session.phase;
     if (phaseAfterBatch === ResearchModePhases.AWAITING_SURVEY) {
       setUiPhase("awaiting_survey");
     } else if (metaRef.current?.drawAdvanceMode === "auto" && !stopRequestedRef.current) {
-      setAutoRemainingMs(AUTO_INTERVAL_MS); // MATCHなし・途中終了もされなかった場合、次のバッチへ向けて再カウントダウン
+      // MATCHなし・途中終了もされなかった場合のみ、全件表示完了後に次のバッチへ向けて再カウントダウンを始める。
+      setAutoRemainingMs(metaRef.current.autoIntervalMs ?? 0);
     }
   }, [uiPhase]);
 
@@ -256,6 +296,8 @@ export function useResearchSession() {
     const meta = metaRef.current;
     if (!meta) return;
 
+    setResumedProgressReset(false); // 実験終了時は「前回の実験を再開しました」通知を消す
+
     const probability = session.getTheoreticalProbability(); // REVEALED到達後のみ呼べる(Core側でgate済み)
     setFinalProbability(probability);
 
@@ -284,7 +326,7 @@ export function useResearchSession() {
       cutoff_draws: summary.censored ? summary.rollCount : null,
       batch_count: meta.batchCount,
       draw_advance_mode: meta.drawAdvanceMode,
-      auto_interval_ms: meta.drawAdvanceMode === "auto" ? AUTO_INTERVAL_MS : null,
+      auto_interval_ms: meta.autoIntervalMs,
       pause_count: meta.drawAdvanceMode === "auto" ? pauseCountRef.current : 0,
       paused_duration_ms: meta.drawAdvanceMode === "auto" ? finalPausedDurationMs : 0,
       theoretical_probability: probability.p,
@@ -372,16 +414,18 @@ export function useResearchSession() {
     pendingSurveyAnswersRef.current = null;
     pauseStartedAtRef.current = null;
     stopRequestedRef.current = false;
+    isRevealingRef.current = false;
     setUiPhase("idle");
     setRollCount(0);
     setCurrentBatchRevealed([]);
+    setIsRevealing(false);
     setFinalRecord(null);
     setFinalProbability(null);
     setResumedProgressReset(false);
     setElapsedMs(0);
     setIsRetiring(false);
     setDrawAdvanceMode(null);
-    setAutoRemainingMs(AUTO_INTERVAL_MS);
+    setAutoRemainingMs(0);
     setIsAutoPaused(false);
     pauseCountRef.current = 0;
     pausedDurationMsRef.current = 0;
