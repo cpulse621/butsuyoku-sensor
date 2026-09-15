@@ -4,7 +4,7 @@ import { GemDatasets, ResearchModePhases, createDefaultRng, createResearchModeSe
 import * as researchStore from "../storage/researchHistory";
 import type { ActiveExperimentSnapshot, DrawAdvanceMode, ExitReason, ResearchExperiment } from "../storage/researchHistory";
 import { toStoredTarget, storedTargetToTarget } from "../lib/targetSummary";
-import { submitExperiment } from "../services/researchSubmission";
+import { attemptSubmission, isSubmissionConfigured } from "../services/researchSubmission";
 
 // app/core/package.json のバージョンをそのまま研究ログのengine_versionとして使う
 // (Coreは変更していないため、ここは既知の実値であり創作ではない)。
@@ -48,6 +48,10 @@ export function useResearchSession() {
   const [isRevealing, setIsRevealing] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   const [finalRecord, setFinalRecord] = useState<ResearchExperiment | null>(null);
+  const finalRecordRef = useRef<ResearchExperiment | null>(null);
+  useEffect(() => {
+    finalRecordRef.current = finalRecord;
+  }, [finalRecord]);
   const [finalProbability, setFinalProbability] = useState<ProbabilityResult | null>(null);
   const [resumedProgressReset, setResumedProgressReset] = useState(false);
   const [elapsedMs, setElapsedMs] = useState(0);
@@ -291,7 +295,9 @@ export function useResearchSession() {
       exit_reason: extra.exitReason,
       engine_version: ENGINE_VERSION,
       data_version: meta.dataset.dataVersion,
-      submission_status: "local_only",
+      // endpoint未設定ならlocal_onlyのまま固定。設定済みならpendingとして保存し、
+      // この直後の送信結果でsent/failedへ更新する(ネットワークの成否に関わらずローカル保存が先)。
+      submission_status: isSubmissionConfigured() ? "pending" : "local_only",
     };
 
     const saved = researchStore.addExperiment(record);
@@ -301,13 +307,14 @@ export function useResearchSession() {
     setIsRetiring(false);
     setUiPhase("revealed");
 
-    // Google Sheets等の送信先が設定されていない限り、常にlocal_onlyのまま(ネットワークアクセスなし)。
-    void submitExperiment(record).then((outcome) => {
-      if (outcome.status !== "local_only") {
-        researchStore.updateExperimentSubmissionStatus(record.experiment_id, outcome.status);
-        setFinalRecord((prev) => (prev && prev.experiment_id === record.experiment_id ? { ...prev, submission_status: outcome.status } : prev));
-      }
-    });
+    // ローカル保存が完了した後にのみ送信を試みる。失敗してもローカルの記録は失われない。
+    if (record.submission_status === "pending") {
+      void attemptSubmission(record).then((outcome) => {
+        if (outcome.status !== "local_only") {
+          setFinalRecord((prev) => (prev && prev.experiment_id === record.experiment_id ? { ...prev, submission_status: outcome.status } : prev));
+        }
+      });
+    }
   }
 
   // MATCH後、または途中終了後の事後アンケート回答。
@@ -347,6 +354,16 @@ export function useResearchSession() {
     setIsRetiring(true);
     setUiPhase("awaiting_survey");
   }, [uiPhase]);
+
+  // 結果画面からの手動再送。pending/failedのままlocalStorageに残っている今回のレコードを再送する。
+  const resendFinalRecord = useCallback(async () => {
+    const current = finalRecordRef.current;
+    if (!current) return;
+    const outcome = await attemptSubmission(current);
+    if (outcome.status !== "local_only") {
+      setFinalRecord((prev) => (prev && prev.experiment_id === current.experiment_id ? { ...prev, submission_status: outcome.status } : prev));
+    }
+  }, []);
 
   const reset = useCallback(() => {
     sessionRef.current = null;
@@ -405,5 +422,6 @@ export function useResearchSession() {
     finalRecord,
     finalProbability,
     saveError,
+    resendFinalRecord,
   };
 }

@@ -114,3 +114,16 @@ const DRAW_ADVANCE_MODE_LABELS: Record<string, string> = {
 export function drawAdvanceModeLabel(mode: string): string {
   return DRAW_ADVANCE_MODE_LABELS[mode] ?? fallbackLabel(mode);
 }
+
+// 参加者向けの送信状態表示。技術用語(pending/failed等)を直接見せず、
+// 送信失敗を「実験の失敗」であるかのように見せない文言にする。
+const SUBMISSION_STATUS_LABELS: Record<string, string> = {
+  local_only: "このブラウザに保存済みです。外部サーバーには未送信です。",
+  pending: "この端末に保存済みです。再送できます。",
+  sent: "研究データを送信しました。",
+  failed: "この端末には保存されています。送信に失敗しました。",
+};
+
+export function submissionStatusLabel(status: string): string {
+  return SUBMISSION_STATUS_LABELS[status] ?? fallbackLabel(status);
+}

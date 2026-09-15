@@ -132,7 +132,12 @@ export function ResearchView({ datasets, dataset, onSelectDataset }: Props) {
     return (
       <>
         <main className="app-layout app-layout--single">
-          <ResearchStatusBar phase={session.uiPhase} rollCount={session.rollCount} onOpenHistory={() => setHistoryOpen(true)} />
+          <ResearchStatusBar
+            phase={session.uiPhase}
+            rollCount={session.rollCount}
+            onOpenHistory={() => setHistoryOpen(true)}
+            submissionStatus={session.finalRecord?.submission_status}
+          />
 
           {session.saveError && (
             <div className="blocker-box">
@@ -145,7 +150,12 @@ export function ResearchView({ datasets, dataset, onSelectDataset }: Props) {
           {session.uiPhase === "awaiting_exit_reason" && <ExitReasonForm onSubmit={session.submitExitReason} />}
 
           {session.uiPhase === "revealed" && session.finalRecord && session.finalProbability && (
-            <ResearchResults record={session.finalRecord} probability={session.finalProbability} onStartNew={handleStartNew} />
+            <ResearchResults
+              record={session.finalRecord}
+              probability={session.finalProbability}
+              onStartNew={handleStartNew}
+              onResend={session.resendFinalRecord}
+            />
           )}
         </main>
 

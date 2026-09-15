@@ -1,7 +1,8 @@
 import { useEffect, useState } from "react";
 import type { ResearchExperiment } from "../storage/researchHistory";
 import { downloadCSV, downloadJSON } from "../lib/download";
-import { effectLabel, enemyLabel, drawAdvanceModeLabel } from "../i18n/labels";
+import { effectLabel, enemyLabel, drawAdvanceModeLabel, submissionStatusLabel } from "../i18n/labels";
+import { attemptSubmission } from "../services/researchSubmission";
 
 interface Props {
   open: boolean;
@@ -23,6 +24,7 @@ function formatDateTime(iso: string): string {
 export function ResearchHistoryPanel({ open, onClose, listExperiments, exportJSON, exportCSV, onDeleteAll }: Props) {
   const [experiments, setExperiments] = useState<ResearchExperiment[]>([]);
   const [deleteError, setDeleteError] = useState<string | null>(null);
+  const [resendingId, setResendingId] = useState<string | null>(null);
 
   useEffect(() => {
     if (open) {
@@ -32,6 +34,13 @@ export function ResearchHistoryPanel({ open, onClose, listExperiments, exportJSO
   }, [open, listExperiments]);
 
   if (!open) return null;
+
+  async function handleResend(experiment: ResearchExperiment) {
+    setResendingId(experiment.experiment_id);
+    await attemptSubmission(experiment);
+    setExperiments(listExperiments()); // 送信結果(sent/failed)を反映して再読み込み
+    setResendingId(null);
+  }
 
   function handleDeleteAll() {
     const confirmed = window.confirm("この端末に保存されている研究履歴をすべて削除します。元に戻せません。よろしいですか？");
@@ -72,6 +81,17 @@ export function ResearchHistoryPanel({ open, onClose, listExperiments, exportJSO
                   {e.sensor_score !== null ? ` / センサー${e.sensor_score}` : ""}
                   {` / ${drawAdvanceModeLabel(e.draw_advance_mode).slice(0, 2)}`}
                 </div>
+                <div className="history-row__stats">{submissionStatusLabel(e.submission_status)}</div>
+                {(e.submission_status === "pending" || e.submission_status === "failed") && (
+                  <button
+                    type="button"
+                    className="link-button"
+                    disabled={resendingId === e.experiment_id}
+                    onClick={() => handleResend(e)}
+                  >
+                    {resendingId === e.experiment_id ? "再送中…" : "未送信データを再送"}
+                  </button>
+                )}
               </div>
             ))}
           </div>

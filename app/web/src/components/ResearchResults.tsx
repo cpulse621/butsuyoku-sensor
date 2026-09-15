@@ -1,6 +1,7 @@
+import { useState } from "react";
 import type { ProbabilityResult } from "motsuyoku-sensor-core";
 import type { ResearchExperiment } from "../storage/researchHistory";
-import { effectLabel, shapeLabel, curseLabel, exitReasonLabel, drawAdvanceModeLabel } from "../i18n/labels";
+import { effectLabel, shapeLabel, curseLabel, exitReasonLabel, drawAdvanceModeLabel, submissionStatusLabel } from "../i18n/labels";
 import { formatOneInN, formatProbability } from "../lib/format";
 import { cumulativeMatchProbability } from "../lib/probability";
 
@@ -8,12 +9,24 @@ interface Props {
   record: ResearchExperiment;
   probability: ProbabilityResult;
   onStartNew: () => void;
+  onResend: () => Promise<void>;
 }
 
 // 研究モードの結果画面。事後アンケート完了後(または途中終了後)にのみ到達する。
 // 理論確率はProbabilityEngineの結果(probability)をそのまま表示するだけで、ここでは一切再計算しない。
-export function ResearchResults({ record, probability, onStartNew }: Props) {
+export function ResearchResults({ record, probability, onStartNew, onResend }: Props) {
+  const [isResending, setIsResending] = useState(false);
   const cumulative = record.success && record.roll_count ? cumulativeMatchProbability(probability.p, record.roll_count) : null;
+  const canResend = record.submission_status === "pending" || record.submission_status === "failed";
+
+  async function handleResend() {
+    setIsResending(true);
+    try {
+      await onResend();
+    } finally {
+      setIsResending(false);
+    }
+  }
 
   return (
     <div className="card">
@@ -112,11 +125,18 @@ export function ResearchResults({ record, probability, onStartNew }: Props) {
         </tbody>
       </table>
 
-      <p className="hint">このブラウザに保存済みです。外部サーバーには未送信です。</p>
+      <p className="hint">{submissionStatusLabel(record.submission_status)}</p>
 
-      <button type="button" className="primary-button" onClick={onStartNew}>
-        新しい実験を始める
-      </button>
+      <div className="pull-controls">
+        {canResend && (
+          <button type="button" className="secondary-button" onClick={handleResend} disabled={isResending}>
+            {isResending ? "再送中…" : "未送信データを再送"}
+          </button>
+        )}
+        <button type="button" className="primary-button" onClick={onStartNew}>
+          新しい実験を始める
+        </button>
+      </div>
     </div>
   );
 }
