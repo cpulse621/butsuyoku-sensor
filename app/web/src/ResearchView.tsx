@@ -3,15 +3,19 @@ import type { GemDataset } from "motsuyoku-sensor-core";
 import { useTargetDraft } from "./hooks/useTargetDraft";
 import { useResearchSession } from "./hooks/useResearchSession";
 import * as researchStore from "./storage/researchHistory";
+import { addRecentTarget } from "./storage/recentTargets";
+import { applyStoredTargetViaSetters } from "./lib/targetSummary";
 import { EnemyTabs } from "./components/EnemyTabs";
 import { ShapePicker } from "./components/ShapePicker";
 import { EffectSlotEditor } from "./components/EffectSlotEditor";
 import { FixedSecondaryEditor } from "./components/FixedSecondaryEditor";
 import { CursePicker } from "./components/CursePicker";
 import { ScoreSelector } from "./components/ScoreSelector";
+import { RecentTargetsPanel } from "./components/RecentTargetsPanel";
 import { ActiveExperimentBanner } from "./components/ActiveExperimentBanner";
-import { RunningExperimentView } from "./components/RunningExperimentView";
+import { ResearchRunningLayout } from "./components/ResearchRunningLayout";
 import { SurveyForm } from "./components/SurveyForm";
+import { ExitReasonForm } from "./components/ExitReasonForm";
 import { ResearchResults } from "./components/ResearchResults";
 import { ResearchStatusBar } from "./components/ResearchStatusBar";
 import { ResearchHistoryPanel } from "./components/ResearchHistoryPanel";
@@ -24,8 +28,10 @@ interface Props {
 
 type LocalStep = "target-setup" | "desire-score";
 
-// 研究モード。experiment_ui_flow_spec.md 3章のフローを、既存のTarget設定UI部品と
-// Core(app/core/src/state/researchModeState.js)のExperiment Flowを使って実装する。
+// 研究モード。Target設定は既存部品(useTargetDraft)を再利用し、実験開始後の
+// Experiment Flow(累計roll_count・MATCH停止・survey gating)はCore
+// (app/core/src/state/researchModeState.js)にそのまま委ねる。
+// manual/auto条件・途中終了時アンケート・退出理由のオーケストレーションはuseResearchSession側で行う。
 export function ResearchView({ datasets, dataset, onSelectDataset }: Props) {
   const [localStep, setLocalStep] = useState<LocalStep>("target-setup");
   const [desireScore, setDesireScore] = useState<1 | 2 | 3 | 4 | 5 | null>(null);
@@ -59,6 +65,14 @@ export function ResearchView({ datasets, dataset, onSelectDataset }: Props) {
 
   function handleStartExperiment() {
     if (!target || desireScore === null) return;
+    addRecentTarget(dataset.datasetId, {
+      shape: target.acceptedShapes,
+      primary_effect_id: target.primaryEffectId,
+      primary_allowed_ranks: target.acceptedPrimaryRanks,
+      secondary_effect_id: target.secondaryEffectId ?? null,
+      secondary_allowed_ranks: target.acceptedSecondaryRanks ?? null,
+      accepted_curse_ids: target.acceptedCurses,
+    });
     session.startExperiment(dataset, target, desireScore);
   }
 
@@ -67,6 +81,17 @@ export function ResearchView({ datasets, dataset, onSelectDataset }: Props) {
     setLocalStep("target-setup");
     setDesireScore(null);
   }
+
+  const historyPanel = (
+    <ResearchHistoryPanel
+      open={historyOpen}
+      onClose={() => setHistoryOpen(false)}
+      listExperiments={researchStore.listExperiments}
+      exportJSON={researchStore.exportExperimentsAsJSON}
+      exportCSV={researchStore.exportExperimentsAsCSV}
+      onDeleteAll={researchStore.deleteAllExperiments}
+    />
+  );
 
   // --- reload直後: 前回の未完了実験がある場合 ---
   if (session.resumeSnapshot) {
@@ -80,11 +105,32 @@ export function ResearchView({ datasets, dataset, onSelectDataset }: Props) {
     );
   }
 
-  // --- 実験中/アンケート中/結果画面: Targetは変更不可 ---
+  // --- 実験中: スクロール不要の実験専用no-scrollレイアウト(manual/auto共通) ---
+  if (session.uiPhase === "running" && session.lockedTarget && session.drawAdvanceMode) {
+    return (
+      <ResearchRunningLayout
+        dataset={dataset}
+        target={session.lockedTarget}
+        rollCount={session.rollCount}
+        elapsedMs={session.elapsedMs}
+        drawAdvanceMode={session.drawAdvanceMode}
+        autoRemainingMs={session.autoRemainingMs}
+        isAutoPaused={session.isAutoPaused}
+        isRevealing={session.isRevealing}
+        currentBatchRevealed={session.currentBatchRevealed}
+        resumedProgressReset={session.resumedProgressReset}
+        onRevealBatch={session.revealBatch}
+        onPauseAuto={session.pauseAuto}
+        onResumeAuto={session.resumeAuto}
+        onGiveUp={session.giveUp}
+      />
+    );
+  }
+
+  // --- 事後アンケート/退出理由/結果画面: Targetは変更不可のためEnemyTabsは表示しない ---
   if (session.uiPhase !== "idle") {
     return (
       <>
-        <EnemyTabs datasets={datasets} current={dataset} onSelect={onSelectDataset} />
         <main className="app-layout app-layout--single">
           <ResearchStatusBar phase={session.uiPhase} rollCount={session.rollCount} onOpenHistory={() => setHistoryOpen(true)} />
 
@@ -94,34 +140,16 @@ export function ResearchView({ datasets, dataset, onSelectDataset }: Props) {
             </div>
           )}
 
-          {(session.uiPhase === "running" || session.uiPhase === "awaiting_survey") && (
-            <RunningExperimentView
-              dataset={dataset}
-              rollCount={session.rollCount}
-              elapsedMs={session.elapsedMs}
-              isRevealing={session.isRevealing}
-              currentBatchRevealed={session.currentBatchRevealed}
-              onRevealBatch={session.revealBatch}
-              onGiveUp={session.giveUp}
-              resumedRollCountReset={session.resumedRollCountReset}
-            />
-          )}
-
           {session.uiPhase === "awaiting_survey" && <SurveyForm onSubmit={session.submitSurvey} />}
+
+          {session.uiPhase === "awaiting_exit_reason" && <ExitReasonForm onSubmit={session.submitExitReason} />}
 
           {session.uiPhase === "revealed" && session.finalRecord && session.finalProbability && (
             <ResearchResults record={session.finalRecord} probability={session.finalProbability} onStartNew={handleStartNew} />
           )}
         </main>
 
-        <ResearchHistoryPanel
-          open={historyOpen}
-          onClose={() => setHistoryOpen(false)}
-          listExperiments={researchStore.listExperiments}
-          exportJSON={researchStore.exportExperimentsAsJSON}
-          exportCSV={researchStore.exportExperimentsAsCSV}
-          onDeleteAll={researchStore.deleteAllExperiments}
-        />
+        {historyPanel}
       </>
     );
   }
@@ -133,6 +161,11 @@ export function ResearchView({ datasets, dataset, onSelectDataset }: Props) {
 
       <main className="app-layout">
         <section className="app-layout__left">
+          <RecentTargetsPanel
+            datasetId={dataset.datasetId}
+            onApply={(stored) => applyStoredTargetViaSetters(stored, { setAllShapes, setPrimaryEffect, setSecondaryEffect, setAllCurses })}
+          />
+
           <ShapePicker dataset={dataset} selected={draft.acceptedShapes} onToggle={toggleShape} onSetAll={setAllShapes} />
 
           <EffectSlotEditor
@@ -215,14 +248,7 @@ export function ResearchView({ datasets, dataset, onSelectDataset }: Props) {
         </section>
       </main>
 
-      <ResearchHistoryPanel
-        open={historyOpen}
-        onClose={() => setHistoryOpen(false)}
-        listExperiments={researchStore.listExperiments}
-        exportJSON={researchStore.exportExperimentsAsJSON}
-        exportCSV={researchStore.exportExperimentsAsCSV}
-        onDeleteAll={researchStore.deleteAllExperiments}
-      />
+      {historyPanel}
     </>
   );
 }

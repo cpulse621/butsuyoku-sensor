@@ -13,6 +13,9 @@ import { ProbabilityPanel } from "./components/ProbabilityPanel";
 import { DrawResultsGrid } from "./components/DrawResultsGrid";
 import { RecordingStatusBar } from "./components/RecordingStatusBar";
 import { HistoryPanel } from "./components/HistoryPanel";
+import { RecentTargetsPanel } from "./components/RecentTargetsPanel";
+import { addRecentTarget } from "./storage/recentTargets";
+import { applyStoredTargetViaSetters } from "./lib/targetSummary";
 
 interface Props {
   datasets: GemDataset[];
@@ -72,6 +75,16 @@ export function SimulatorView({ datasets, dataset, onSelectDataset }: Props) {
       setPullBatchCount((c) => c + 1);
       setPullError(null);
       recordBatch(gems); // localStorageへ要約のみ記録(storage/simulationHistory.ts経由。Target未設定時は内部で何もしない)
+      if (target) {
+        addRecentTarget(dataset.datasetId, {
+          shape: target.acceptedShapes,
+          primary_effect_id: target.primaryEffectId,
+          primary_allowed_ranks: target.acceptedPrimaryRanks,
+          secondary_effect_id: target.secondaryEffectId ?? null,
+          secondary_allowed_ranks: target.acceptedSecondaryRanks ?? null,
+          accepted_curse_ids: target.acceptedCurses,
+        });
+      }
     } catch (err) {
       setPullError(err instanceof Error ? err.message : String(err));
     }
@@ -85,6 +98,11 @@ export function SimulatorView({ datasets, dataset, onSelectDataset }: Props) {
 
       <main className="app-layout">
         <section className="app-layout__left">
+          <RecentTargetsPanel
+            datasetId={dataset.datasetId}
+            onApply={(stored) => applyStoredTargetViaSetters(stored, { setAllShapes, setPrimaryEffect, setSecondaryEffect, setAllCurses })}
+          />
+
           <ShapePicker dataset={dataset} selected={draft.acceptedShapes} onToggle={toggleShape} onSetAll={setAllShapes} />
 
           <EffectSlotEditor

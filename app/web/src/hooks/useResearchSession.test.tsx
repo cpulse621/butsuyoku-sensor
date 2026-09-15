@@ -193,15 +193,33 @@ describe("hooks/useResearchSession", () => {
     expect(localStorage.getItem("motsuyoku_sensor_active_experiment_v1")).toBeNull();
   });
 
-  it("途中終了(giveUp)はsuccess=false, censored=true, roll_count=nullで保存される", () => {
-    mocks.sessionFactory = () => createFakeCoreSession(null);
+  it("途中終了(giveUp)は必ず事後アンケート→退出理由を経由してから確定する(即結果画面へは飛ばない)", () => {
+    const fake = createFakeCoreSession(null);
+    mocks.sessionFactory = () => fake;
     const { result } = renderHook(() => useResearchSession());
 
     act(() => {
       result.current.startExperiment(TEST_DATASET, TEST_TARGET, 2);
     });
+
+    // giveUpを押した直後はまだ結果画面に飛ばず、事後アンケートへ進む(Coreのgiveup()もまだ呼ばれない)
     act(() => {
       result.current.giveUp();
+    });
+    expect(result.current.uiPhase).toBe("awaiting_survey");
+    expect(fake.phase).toBe("running"); // Core内部はまだgiveUp()されていない
+    expect(result.current.finalRecord).toBeNull();
+
+    // アンケート回答 → 退出理由待ちへ
+    act(() => {
+      result.current.submitSurvey({ tediousnessScore: 4, painIfRepeatedScore: 2, sensorScore: 1 });
+    });
+    expect(result.current.uiPhase).toBe("awaiting_exit_reason");
+    expect(result.current.finalRecord).toBeNull(); // まだ理論確率も結果も出さない
+
+    // 退出理由回答 → ここで初めて確定する
+    act(() => {
+      result.current.submitExitReason("tedious");
     });
 
     expect(result.current.uiPhase).toBe("revealed");
@@ -209,12 +227,60 @@ describe("hooks/useResearchSession", () => {
     expect(result.current.finalRecord?.censored).toBe(true);
     expect(result.current.finalRecord?.roll_count).toBeNull();
     expect(result.current.finalRecord?.cutoff_draws).toBe(0);
-    // giveUpはCoreの設計上surveyを経由しないため、survey系スコアはnullのまま
-    expect(result.current.finalRecord?.tedious_score).toBeNull();
+    // giveUp時もアンケートで集めた回答がそのまま保存される(Coreのsummary.surveyには依存しない)
+    expect(result.current.finalRecord?.tedious_score).toBe(4);
+    expect(result.current.finalRecord?.sensor_score).toBe(1);
+    expect(result.current.finalRecord?.exit_reason).toBe("tedious");
 
     const saved = listExperiments();
     expect(saved).toHaveLength(1);
     expect(saved[0].censored).toBe(true);
+    expect(saved[0].exit_reason).toBe("tedious");
+  });
+
+  it("manual/autoは実験開始時にランダムへ割り当てられ、参加者は選べない", () => {
+    mocks.sessionFactory = () => createFakeCoreSession(null);
+    const { result } = renderHook(() => useResearchSession());
+
+    act(() => {
+      result.current.startExperiment(TEST_DATASET, TEST_TARGET, 3);
+    });
+
+    expect(["manual", "auto"]).toContain(result.current.drawAdvanceMode);
+  });
+
+  it("auto条件では一時停止/再開の回数と時間が記録され、最終レコードのauto_interval_msは10000になる", async () => {
+    const fake = createFakeCoreSession(1);
+    mocks.sessionFactory = () => fake;
+    const randomSpy = vi.spyOn(Math, "random").mockReturnValue(0.9); // 0.5以上 -> "auto"
+    const { result } = renderHook(() => useResearchSession());
+
+    act(() => {
+      result.current.startExperiment(TEST_DATASET, TEST_TARGET, 3);
+    });
+    randomSpy.mockRestore();
+
+    expect(result.current.drawAdvanceMode).toBe("auto");
+
+    act(() => {
+      result.current.pauseAuto();
+    });
+    expect(result.current.isAutoPaused).toBe(true);
+    act(() => {
+      result.current.resumeAuto();
+    });
+    expect(result.current.isAutoPaused).toBe(false);
+
+    await act(async () => {
+      await result.current.revealBatch();
+    });
+    act(() => {
+      result.current.submitSurvey({ tediousnessScore: 1, painIfRepeatedScore: 1, sensorScore: 1 });
+    });
+
+    expect(result.current.finalRecord?.draw_advance_mode).toBe("auto");
+    expect(result.current.finalRecord?.auto_interval_ms).toBe(10000);
+    expect(result.current.finalRecord?.pause_count).toBe(1);
   });
 
   it("reload時にactive experimentが存在すれば、resumeSnapshotとして拾える", () => {
@@ -234,6 +300,8 @@ describe("hooks/useResearchSession", () => {
         accepted_curse_ids: ["stamina_cost_up"],
       },
       desire_score: 3,
+      draw_advance_mode: "manual",
+      auto_interval_ms: null,
     });
 
     const { result } = renderHook(() => useResearchSession());

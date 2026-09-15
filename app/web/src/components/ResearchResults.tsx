@@ -1,6 +1,6 @@
 import type { ProbabilityResult } from "motsuyoku-sensor-core";
 import type { ResearchExperiment } from "../storage/researchHistory";
-import { effectLabel, shapeLabel, curseLabel } from "../i18n/labels";
+import { effectLabel, shapeLabel, curseLabel, exitReasonLabel, drawAdvanceModeLabel } from "../i18n/labels";
 import { formatOneInN, formatProbability } from "../lib/format";
 import { cumulativeMatchProbability } from "../lib/probability";
 
@@ -55,6 +55,24 @@ export function ResearchResults({ record, probability, onStartNew }: Props) {
             <td>実際の試行回数</td>
             <td>{record.success ? `${record.roll_count} 回` : `${record.cutoff_draws} 回（未達成のため打ち切り）`}</td>
           </tr>
+          <tr>
+            <td>進行方式</td>
+            <td>{drawAdvanceModeLabel(record.draw_advance_mode)}</td>
+          </tr>
+          {record.draw_advance_mode === "auto" && (
+            <tr>
+              <td>一時停止</td>
+              <td>
+                {record.pause_count}回（合計 {Math.round(record.paused_duration_ms / 1000)}秒）
+              </td>
+            </tr>
+          )}
+          {record.exit_reason !== null && (
+            <tr>
+              <td>終了した主な理由</td>
+              <td>{exitReasonLabel(record.exit_reason)}</td>
+            </tr>
+          )}
           <tr>
             <td>理論確率 p</td>
             <td>{formatProbability(probability.p)}</td>

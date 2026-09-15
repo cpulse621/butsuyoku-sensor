@@ -1,7 +1,7 @@
 import { useEffect, useState } from "react";
 import type { ResearchExperiment } from "../storage/researchHistory";
 import { downloadCSV, downloadJSON } from "../lib/download";
-import { effectLabel, enemyLabel } from "../i18n/labels";
+import { effectLabel, enemyLabel, drawAdvanceModeLabel } from "../i18n/labels";
 
 interface Props {
   open: boolean;
@@ -70,6 +70,7 @@ export function ResearchHistoryPanel({ open, onClose, listExperiments, exportJSO
                 <div className="history-row__stats">
                   欲しさ{e.desire_score} / {e.success ? "成功" : "途中終了"} / 試行{e.success ? e.roll_count : e.cutoff_draws}回
                   {e.sensor_score !== null ? ` / センサー${e.sensor_score}` : ""}
+                  {` / ${drawAdvanceModeLabel(e.draw_advance_mode).slice(0, 2)}`}
                 </div>
               </div>
             ))}

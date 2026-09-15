@@ -45,6 +45,11 @@ declare module "motsuyoku-sensor-core" {
     __blockedReason?: string;
   }
 
+  // そのプール内でのeffectIdの(排他前の)raw確率。0〜1。見つからなければ0。
+  // UI側での並び替え(例: カテゴリ内を出現確率順に)にのみ用い、画面へ数値そのものを
+  // 表示する用途には使わない(研究モードでは実験終了まで確率を非公開にするため)。
+  export function effectProbability(pool: EffectPool, effectId: string): number;
+
   export interface CursePoolEntry {
     curseId: string;
     weight: number;

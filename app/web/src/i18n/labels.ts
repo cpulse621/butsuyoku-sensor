@@ -93,3 +93,24 @@ export function matchStatusLabel(matched: boolean | null): string {
   if (matched === null) return "Target未設定";
   return matched ? "条件一致" : "条件外";
 }
+
+const EXIT_REASON_LABELS: Record<string, string> = {
+  no_target: "なかなか目的の血晶が出なかった",
+  tedious: "抽選操作が面倒になった",
+  time_limit: "時間の都合",
+  lost_motivation: "実験を続ける気がなくなった",
+  other: "その他",
+};
+
+export function exitReasonLabel(reason: string): string {
+  return EXIT_REASON_LABELS[reason] ?? fallbackLabel(reason);
+}
+
+const DRAW_ADVANCE_MODE_LABELS: Record<string, string> = {
+  manual: "手動（自分で次の10連を開始）",
+  auto: "自動（一定時間ごとに自動進行）",
+};
+
+export function drawAdvanceModeLabel(mode: string): string {
+  return DRAW_ADVANCE_MODE_LABELS[mode] ?? fallbackLabel(mode);
+}

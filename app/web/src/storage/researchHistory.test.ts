@@ -36,11 +36,16 @@ function makeExperiment(overrides: Partial<ResearchExperiment> = {}): ResearchEx
     roll_count: 42,
     cutoff_draws: null,
     batch_count: 5,
+    draw_advance_mode: "manual",
+    auto_interval_ms: null,
+    pause_count: 0,
+    paused_duration_ms: 0,
     theoretical_probability: 0.1258,
     expected_draws: 7.95,
     tedious_score: 3,
     real_game_burden_score: 4,
     sensor_score: 5,
+    exit_reason: null,
     engine_version: "motsuyoku-sensor-core@0.1.0",
     data_version: "v0.12-watchers",
     submission_status: "local_only",
@@ -67,7 +72,7 @@ describe("storage/researchHistory", () => {
     expect(list.map((e) => e.experiment_id)).toEqual(["e2", "e1"]);
   });
 
-  it("途中終了(censored)のexperimentも保存できる(roll_count=null, cutoff_draws=件数)", () => {
+  it("途中終了(censored)のexperimentも保存できる(roll_count=null, cutoff_draws=件数, exit_reasonあり)", () => {
     addExperiment(
       makeExperiment({
         experiment_id: "e-censored",
@@ -75,9 +80,7 @@ describe("storage/researchHistory", () => {
         censored: true,
         roll_count: null,
         cutoff_draws: 3,
-        tedious_score: null,
-        real_game_burden_score: null,
-        sensor_score: null,
+        exit_reason: "tedious",
       })
     );
     const [exp] = listExperiments();
@@ -85,6 +88,7 @@ describe("storage/researchHistory", () => {
     expect(exp.censored).toBe(true);
     expect(exp.roll_count).toBeNull();
     expect(exp.cutoff_draws).toBe(3);
+    expect(exp.exit_reason).toBe("tedious");
   });
 
   it("deleteAllExperimentsで全件消える", () => {
@@ -113,6 +117,8 @@ describe("storage/researchHistory", () => {
         accepted_curse_ids: ["stamina_cost_up"],
       },
       desire_score: 3,
+      draw_advance_mode: "auto",
+      auto_interval_ms: 10000,
     });
 
     // storageはインメモリキャッシュを持たないため、再度呼ぶこと自体がreload後の読み直しと等価。

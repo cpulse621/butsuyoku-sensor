@@ -19,6 +19,11 @@ const MAX_EXPERIMENTS = 500;
 
 export type SubmissionStatus = "local_only" | "pending" | "sent" | "failed";
 
+export type DrawAdvanceMode = "manual" | "auto";
+
+// 途中終了(censored)時の主な理由。sensor_score回答後にのみ尋ねる(回答誘導を避けるため)。
+export type ExitReason = "no_target" | "tedious" | "time_limit" | "lost_motivation" | "other";
+
 export interface ResearchExperiment {
   experiment_id: string;
   participant_id: string;
@@ -42,12 +47,21 @@ export interface ResearchExperiment {
   cutoff_draws: number | null;
   batch_count: number;
 
+  // manual/auto比較用(PHASE追加分)。参加者には選択させず、実験開始時にランダム割り当てる。
+  draw_advance_mode: DrawAdvanceMode;
+  auto_interval_ms: number | null; // manualの場合null
+  pause_count: number; // autoの一時停止回数(manualは常に0)
+  paused_duration_ms: number; // autoの一時停止累計時間(manualは常に0)
+
   theoretical_probability: number | null;
   expected_draws: number | null;
 
   tedious_score: number | null;
   real_game_burden_score: number | null;
   sensor_score: number | null;
+
+  // 途中終了時のみ設定(成功時はnull)。sensor_score回答後に尋ねる。
+  exit_reason: ExitReason | null;
 
   engine_version: string;
   data_version: string;
@@ -66,6 +80,8 @@ export interface ActiveExperimentSnapshot {
   enemy_display_name: string;
   target: StoredTarget;
   desire_score: 1 | 2 | 3 | 4 | 5;
+  draw_advance_mode: DrawAdvanceMode;
+  auto_interval_ms: number | null;
 }
 
 export interface StorageResult {
@@ -198,11 +214,16 @@ const CSV_HEADERS = [
   "roll_count",
   "cutoff_draws",
   "batch_count",
+  "draw_advance_mode",
+  "auto_interval_ms",
+  "pause_count",
+  "paused_duration_ms",
   "theoretical_probability",
   "expected_draws",
   "tedious_score",
   "real_game_burden_score",
   "sensor_score",
+  "exit_reason",
   "engine_version",
   "data_version",
   "submission_status",
@@ -232,11 +253,16 @@ export function exportExperimentsAsCSV(): string {
       e.roll_count,
       e.cutoff_draws,
       e.batch_count,
+      e.draw_advance_mode,
+      e.auto_interval_ms,
+      e.pause_count,
+      e.paused_duration_ms,
       e.theoretical_probability,
       e.expected_draws,
       e.tedious_score,
       e.real_game_burden_score,
       e.sensor_score,
+      e.exit_reason,
       e.engine_version,
       e.data_version,
       e.submission_status,
