@@ -5,6 +5,7 @@ Apps Script(`Code.gs`)とクライアント側ResearchDraws送信の設計contra
 ## 実装状況(2026-09-18時点)
 
 - **クライアント側(`app/web`)は本仕様に対応済み**: `services/researchSubmission.ts`(Experiments、`request_type: "experiment"`のenvelope)、`services/researchDrawsSubmission.ts`(ResearchDraws、250件/chunkでの`request_type: "research_draws_chunk"`送信)、`services/appsScriptEndpoint.ts`(共通POST処理)。
+- **クライアント側はchunk成功条件`received === inserted + duplicates`をローカルで検証する**: `services/researchDrawsSubmission.ts`はApps Scriptのレスポンスがこの等式を満たした場合のみそのchunkを成功として扱い、`storage/researchDrawsSyncStatus.ts`(ブラウザのlocalStorageのみ、Experimentsの`submission_status`ともSheets側の`draw_detail_status`とも独立)へ「どのdraw_indexまでack済みか」を永続化する。次回`syncResearchDrawsForExperiment`を呼ぶと、そのexperiment_idについて未ack分のchunkだけを送り直す(タブを閉じてもresume可能)。等式が崩れる・レスポンス形状が壊れている場合はHTTP自体が200でも失敗として扱い、進捗を進めない。
 - **Apps Script側は未デプロイ**: `apps_script/Code.gs`に本仕様のリファレンス実装を書き起こしたが、実際のプロジェクトの現行`Code.gs`を直接見て差分マージしたものではない。デプロイ前に必ず`apps_script/README.md`のレビュー手順に従うこと。
 - 実際のGoogle Apps Scriptエンドポイントに対しては本ラウンドでは一切送信していない(未レビューのスクリプトに対して本番の研究データを送るリスクを避けるため)。ブラウザ確認は`VITE_RESEARCH_ENDPOINT`未設定の状態(`local_only`扱い)でのみ行った。
 - `success_cdf_at_roll` / `survival_probability_at_cutoff`のR1C1相対参照修正は、実際の数式を見ていないため`apps_script/Code.gs`に含まれていない。
@@ -154,7 +155,7 @@ ResearchDraws受信時は最低限、処理件数を返す:
 
 1. **`draw_detail_count`はExperiments側に保存する。** これは**ローカルで記録されたvisible ResearchDrawsの期待件数**(そのexperiment_idでIndexedDBに保存されている行数)であり、Apps Scriptへのupload済み件数ではない。クライアントは自分がローカルに何件記録したかを報告するだけで、送信の成否は別途chunkの成否で判断する。
 2. **`draw_detail_status`は永続フィールドとして持たない。** complete / incompleteは、Analysis時にResearchDraws側の`experiment_id`別行数と、Experiments側の`draw_detail_count`を突き合わせて導出する（`ResearchDrawsの実際の行数 === Experiments.draw_detail_count` ならcomplete）。これにより、ResearchDraws送信が後から進んだ際にExperiments側の1行を更新しにいくAPI(後更新API)が不要になる。Apps Script側もクライアント側も、この列への書き込み・読み出しロジックを実装しない。
-3. **chunk成功条件は `received === inserted + duplicates`。** Apps Scriptはこの等式が成り立つ場合のみそのchunkを成功として扱う。成り立たない場合(=一部rowが検証エラー等でinsertされず、duplicateにもならなかった)はchunk失敗として扱い、4節のvalidation方針に従って書き込みを行わない。
+3. **chunk成功条件は `received === inserted + duplicates`。** Apps Scriptはこの等式が成り立つ場合のみそのchunkを成功として扱う。成り立たない場合(=一部rowが検証エラー等でinsertされず、duplicateにもならなかった)はchunk失敗として扱い、4節のvalidation方針に従って書き込みを行わない。**クライアント側(`services/researchDrawsSubmission.ts`)もこの等式を自分で検証しており**、HTTPレベルで200が返っただけでは成功とみなさず、等式が崩れていれば(またはレスポンス形状が読み取れなければ)そのchunkを失敗として扱い、`storage/researchDrawsSyncStatus.ts`上のack済みdraw_indexを前進させない。
 4. **ResearchDraws chunkは書き込み前に全rowをvalidationする。**
    - malformedなrow(必須フィールド欠落・型不一致等)を黙ってskipしてはいけない。
    - validationに1件でも失敗した場合、**原則としてchunk全体を失敗させ、`setValues`を一切実行しない**(部分書き込みをしない)。

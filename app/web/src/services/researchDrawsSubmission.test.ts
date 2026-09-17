@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { appendDraw, DRAW_DETAIL_SCHEMA_VERSION } from "../storage/researchDrawsDb";
 import type { ResearchDrawRecord } from "../storage/researchDrawsDb";
+import { getResearchDrawsSyncStatus } from "../storage/researchDrawsSyncStatus";
 
 function makeDraw(overrides: Partial<ResearchDrawRecord> = {}): ResearchDrawRecord {
   return {
@@ -32,6 +33,7 @@ describe("services/researchDrawsSubmission", () => {
     vi.unstubAllEnvs();
     vi.unstubAllGlobals();
     vi.resetModules();
+    localStorage.clear();
   });
 
   afterEach(() => {
@@ -93,7 +95,10 @@ describe("services/researchDrawsSubmission", () => {
       await appendDraw(makeDraw({ draw_index: i, experiment_id: "exp-big" }));
     }
     const { syncResearchDrawsForExperiment } = await import("./researchDrawsSubmission");
-    const fetchSpy = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ ok: true }) });
+    const fetchSpy = vi
+      .fn()
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ ok: true, received: 250, inserted: 250, duplicates: 0 }) })
+      .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ ok: true, received: 50, inserted: 50, duplicates: 0 }) });
     vi.stubGlobal("fetch", fetchSpy);
 
     const outcome = await syncResearchDrawsForExperiment("exp-big");
@@ -108,7 +113,7 @@ describe("services/researchDrawsSubmission", () => {
     expect(secondBody.chunk_id).toBe("exp-big:251-300");
   });
 
-  it("途中のchunkが失敗したら、それ以降のchunkは送らず失敗を返す(再送で最初から送り直す設計)", async () => {
+  it("最初のchunkが失敗したら、それ以降のchunkは送らず失敗を返す(synced_through_draw_indexは進めない)", async () => {
     vi.stubEnv("VITE_RESEARCH_ENDPOINT", "https://example.com/exec");
     for (let i = 1; i <= 300; i++) {
       // eslint-disable-next-line no-await-in-loop
@@ -121,6 +126,10 @@ describe("services/researchDrawsSubmission", () => {
     const outcome = await syncResearchDrawsForExperiment("exp-fail");
     expect(outcome.status).toBe("failed");
     expect(fetchSpy).toHaveBeenCalledTimes(1); // 2つ目のchunkは送られない
+
+    const status = getResearchDrawsSyncStatus("exp-fail");
+    expect(status?.state).toBe("failed");
+    expect(status?.synced_through_draw_index).toBe(0);
   });
 
   it("ネットワーク例外もfailedとして扱う", async () => {
@@ -131,5 +140,76 @@ describe("services/researchDrawsSubmission", () => {
 
     const outcome = await syncResearchDrawsForExperiment("exp-net-error");
     expect(outcome.status).toBe("failed");
+  });
+
+  describe("送信進捗の永続化(再起動をまたいだ再送)", () => {
+    it("全chunk成功後、synced_through_draw_indexが永続化され、次回呼び出しではネットワークアクセスしない", async () => {
+      vi.stubEnv("VITE_RESEARCH_ENDPOINT", "https://example.com/exec");
+      await appendDraw(makeDraw({ draw_index: 1, experiment_id: "exp-resume-ok" }));
+      await appendDraw(makeDraw({ draw_index: 2, experiment_id: "exp-resume-ok" }));
+      const { syncResearchDrawsForExperiment } = await import("./researchDrawsSubmission");
+      const fetchSpy = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ ok: true, received: 2, inserted: 2, duplicates: 0 }) });
+      vi.stubGlobal("fetch", fetchSpy);
+
+      const first = await syncResearchDrawsForExperiment("exp-resume-ok");
+      expect(first).toEqual({ status: "synced", chunkCount: 1, drawCount: 2 });
+      const status = getResearchDrawsSyncStatus("exp-resume-ok");
+      expect(status?.state).toBe("synced");
+      expect(status?.synced_through_draw_index).toBe(2);
+
+      const second = await syncResearchDrawsForExperiment("exp-resume-ok");
+      expect(second).toEqual({ status: "synced", chunkCount: 0, drawCount: 0 });
+      expect(fetchSpy).toHaveBeenCalledTimes(1); // 2回目はネットワークアクセスなし
+    });
+
+    it("1つ目のchunkが成功し2つ目が失敗した場合、synced_through_draw_indexは1つ目の末尾まで進み、次回はそれ以降だけを再送する", async () => {
+      vi.stubEnv("VITE_RESEARCH_ENDPOINT", "https://example.com/exec");
+      for (let i = 1; i <= 300; i++) {
+        // eslint-disable-next-line no-await-in-loop
+        await appendDraw(makeDraw({ draw_index: i, experiment_id: "exp-partial" }));
+      }
+      const { syncResearchDrawsForExperiment } = await import("./researchDrawsSubmission");
+      const fetchSpy = vi
+        .fn()
+        .mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ ok: true, received: 250, inserted: 250, duplicates: 0 }) })
+        .mockResolvedValueOnce({ ok: false, status: 500 });
+      vi.stubGlobal("fetch", fetchSpy);
+
+      const first = await syncResearchDrawsForExperiment("exp-partial");
+      expect(first.status).toBe("failed");
+      expect(fetchSpy).toHaveBeenCalledTimes(2);
+      const statusAfterFirst = getResearchDrawsSyncStatus("exp-partial");
+      expect(statusAfterFirst?.state).toBe("failed");
+      expect(statusAfterFirst?.synced_through_draw_index).toBe(250); // 1つ目のchunkの進捗は残る
+
+      fetchSpy.mockReset();
+      fetchSpy.mockResolvedValue({ ok: true, status: 200, json: async () => ({ ok: true, received: 50, inserted: 50, duplicates: 0 }) });
+      const second = await syncResearchDrawsForExperiment("exp-partial");
+      expect(second).toEqual({ status: "synced", chunkCount: 1, drawCount: 50 });
+      expect(fetchSpy).toHaveBeenCalledTimes(1); // 251-300だけを再送
+      const secondBody = JSON.parse(fetchSpy.mock.calls[0][1].body);
+      expect(secondBody.chunk_id).toBe("exp-partial:251-300");
+      expect(secondBody.draws).toHaveLength(50);
+
+      const statusAfterSecond = getResearchDrawsSyncStatus("exp-partial");
+      expect(statusAfterSecond?.state).toBe("synced");
+      expect(statusAfterSecond?.synced_through_draw_index).toBe(300);
+    });
+
+    it("received !== inserted + duplicatesの場合はHTTP成功でも失敗として扱い、synced_through_draw_indexを進めない", async () => {
+      vi.stubEnv("VITE_RESEARCH_ENDPOINT", "https://example.com/exec");
+      await appendDraw(makeDraw({ draw_index: 1, experiment_id: "exp-inconsistent" }));
+      await appendDraw(makeDraw({ draw_index: 2, experiment_id: "exp-inconsistent" }));
+      const { syncResearchDrawsForExperiment } = await import("./researchDrawsSubmission");
+      // received=2だがinserted+duplicates=1で不整合。Apps Script側の部分失敗を模したケース。
+      const fetchSpy = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ ok: true, received: 2, inserted: 1, duplicates: 0 }) });
+      vi.stubGlobal("fetch", fetchSpy);
+
+      const outcome = await syncResearchDrawsForExperiment("exp-inconsistent");
+      expect(outcome.status).toBe("failed");
+      const status = getResearchDrawsSyncStatus("exp-inconsistent");
+      expect(status?.state).toBe("failed");
+      expect(status?.synced_through_draw_index).toBe(0);
+    });
   });
 });

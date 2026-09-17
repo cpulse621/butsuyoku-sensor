@@ -13,9 +13,11 @@
 - コインシステム: `coin_cost = max(1, round(100 × I(g)/H(dataset)))`、`initial_coin = 100,000`。試行回数・残りコイン・使用コインを研究中常時表示。coin<=0かつTarget未達なら`termination_reason="coin_exhausted"`として事後アンケート後に直接finalize(退出理由は挟まない。participant_giveupとは区別)。同一drawでTarget Matchと同時発生した場合はTarget Matchを優先
 - `researchEligible`: `expected_draws <= 1,000`を研究モードのTarget選択UIにのみ適用(`app/web/src/lib/researchEligibility.ts`)。DrawEngineの分布・Simulator modeには影響しない
 
-DrawEngine/ProbabilityEngine(app/core)自体はこの一連の作業を通じて一切変更していない(Fidelity Contract・確率モデルは不変)。テスト: Core 43/43、Web 98/98、TypeScript・productionビルドともに成功、ブラウザ実機確認済み(3draw・Target Match・survey・finalize・IndexedDB上のcoin_cost等の実値まで確認)。
+DrawEngine/ProbabilityEngine(app/core)自体はこの一連の作業を通じて一切変更していない(Fidelity Contract・確率モデルは不変)。テスト: Core 44/44(`node --test`。ワークスペースの`npm test`スクリプトはNode 24環境で`node --test test/`の解釈が変わり動かないことがあるが、コード自体の問題ではない)、Web 109/109、TypeScript・productionビルドともに成功、ブラウザ実機確認済み(3draw・Target Match・survey・finalize・IndexedDB上のcoin_cost等の実値まで確認)。
 
-クライアント側のResearchDraws送信処理も本ラウンドで実装済み: `services/researchDrawsSubmission.ts`が250件/chunkで`request_type: "research_draws_chunk"`のenvelopeを送信し、`finalize()`・`resendFinalRecord()`・`ResearchHistoryPanel`の再送・`App.tsx`起動時のpending/failed再送ヒューリスティックに配線済み。`services/researchSubmission.ts`もExperimentsを`request_type: "experiment"`のenvelopeで送るよう変更済み(旧`request_type`無しPOSTとの後方互換はApps Script側で担保する前提)。
+クライアント側のResearchDraws送信処理も実装済み: `services/researchDrawsSubmission.ts`が250件/chunkで`request_type: "research_draws_chunk"`のenvelopeを送信し、`finalize()`・`resendFinalRecord()`・`ResearchHistoryPanel`の再送・`App.tsx`起動時のpending/failed再送ヒューリスティックに配線済み。`services/researchSubmission.ts`もExperimentsを`request_type: "experiment"`のenvelopeで送るよう変更済み(旧`request_type`無しPOSTとの後方互換はApps Script側で担保する前提)。
+
+**ResearchDraws送信進捗の永続化(2026-09-18追加)**: `services/researchDrawsSubmission.ts`はApps Scriptのレスポンスが`received === inserted + duplicates`を満たした場合のみそのchunkを成功として扱い、`storage/researchDrawsSyncStatus.ts`(localStorage、キー`butsuyoku_sensor_research_draws_sync_v1`)へexperiment_id単位で「どのdraw_indexまでack済みか」を永続化する。これはExperiments側の`submission_status`ともSheets側の`draw_detail_status`(永続フィールドとして持たない設計のまま)とも独立したブラウザ内だけの状態であり、途中chunkの失敗やタブを閉じた後の再起動を跨いでも、次回`syncResearchDrawsForExperiment`呼び出し時に未ack分のchunkだけを送り直す。HTTPが200でも上記等式が崩れていれば失敗として扱い進捗を進めない。dedupeの正本(`experiment_id + draw_index`)は引き続きサーバー側にあるため、万一ローカルの進捗がサーバーの実態とズレても安全に吸収される。
 
 ## 次にやること(このセッションでは着手していない)
 
@@ -38,7 +40,7 @@ DrawEngine/ProbabilityEngine(app/core)自体はこの一連の作業を通じて
 
 - `apps_script/Code.gs`(新規): `docs/apps_script_v3_spec.md`の合意事項を書き起こした**リファレンス実装**。**実際のプロジェクトの現行`Code.gs`を直接見て差分を取ったものではない**ため、そのままデプロイせず、既存コードとのマージ・レビューが必須(`apps_script/README.md`に手順あり)。実装内容: `request_type`によるrouting(無指定は`experiment`として後方互換扱い)、Experiments用のheader名ベース読み書き(`ensureHeadersExist`で新規v3列を右側に自動追加)、ResearchDraws用の全rowバリデーション→**1件でも不正なら`setValues`を一切呼ばずchunk全体を失敗させる**書き込み、`experiment_id+draw_index`複合キーでの重複除外、`{ok, received, inserted, duplicates}`レスポンス。
 - `success_cdf_at_roll` / `survival_probability_at_cutoff`のR1C1修正は**未実装**(上記4参照)。
-- クライアント側には「ResearchDrawsをApps Scriptへ送信済みかどうか」を示す永続フィールドが無い(意図的な設計。`docs/apps_script_v3_spec.md`8節参照)。そのため`App.tsx`起動時の再送は、Experiments側の`submission_status`が`pending`/`failed`のexperiment_idに対してResearchDrawsも一緒に再送を試みる、という**ヒューリスティック**に留まる。ResearchDrawsだけが未送信でExperimentsは送信済み、というケースの自動リカバリはこの仕組みではカバーされない(手動での`ResearchHistoryPanel`からの再送、または将来の専用ステータス列追加で対応)。
+- クライアント側の`storage/researchDrawsSyncStatus.ts`により、「ResearchDrawsのどこまでApps Scriptへack済みか」はexperiment_id単位でlocalStorageに永続化されるようになった(2026-09-18時点で解消済み)。`App.tsx`起動時の再送は依然としてExperiments側の`submission_status`が`pending`/`failed`のexperiment_idを対象に`syncResearchDrawsForExperiment`を呼ぶヒューリスティックのままだが、その内部では未ack分のchunkだけが実際に再送される。ただし「Experimentsは送信済みだがResearchDrawsだけ未送信」というケースをApps Script側からの応答だけで自動検知して起動時にトリガーする仕組みはまだ無く、その場合は手動で`ResearchHistoryPanel`から再送するか、`getResearchDrawsSyncStatus(experimentId)`を使ってstate!=="synced"のexperiment_idを別途スキャンする対応が必要(現状は実装していない)。
 - 実際のGoogle Apps Scriptエンドポイントに対する送信テストは**本ラウンドでは一切行っていない**(未レビューのスクリプトに本番研究データを送るリスクを避けるため)。ブラウザ確認は`VITE_RESEARCH_ENDPOINT`未設定(`local_only`)の状態でのみ実施し、IndexedDB上の`ResearchDraws`レコード(`coin_cost`/`coin_remaining_after_draw`/`gem_probability_exact`/`gem_surprisal_bits`等)が実値で正しく記録されることを確認した。
 
 **ResearchDraws受信の設計要件の要点(詳細は`docs/apps_script_v3_spec.md`)**:
@@ -83,6 +85,7 @@ DrawEngine/ProbabilityEngine(app/core)自体はこの一連の作業を通じて
 - researchEligible: `app/web/src/lib/researchEligibility.ts`
 - 実験フロー全体: `app/web/src/hooks/useResearchSession.ts`
 - ResearchDraws永続化: `app/web/src/storage/researchDrawsDb.ts`
+- ResearchDraws送信進捗の永続化(ブラウザ内のみ): `app/web/src/storage/researchDrawsSyncStatus.ts`
 - Experiments永続化・CSV: `app/web/src/storage/researchHistory.ts`
 - 送信共通処理: `app/web/src/services/appsScriptEndpoint.ts`
 - 送信DTO・Experiments送信: `app/web/src/services/submissionDto.ts` / `app/web/src/services/researchSubmission.ts`

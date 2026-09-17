@@ -5,15 +5,20 @@
 // visible drawをchunk化してまとめて送信する(3節・5節)。
 //
 // dedupeの正本は`experiment_id + draw_index`の複合キーであり、chunk_idそのものではない
-// (Apps Script側がchunk内の各rowをこのキーで判定する)。そのため、このモジュールは
-// 「どのchunkを送信済みか」をローカルで追跡しない: 毎回そのexperiment_idの全visible drawを
-// 読み直し、chunkに分けて送り直す単純な実装にしている。再送しても重複行が増えないことは
-// サーバー側の冪等性に委ねる(このexperiment_id単位の再送は、通常は数百〜数千件程度で
-// 十分現実的なコストに収まる想定)。
+// (Apps Script側がchunk内の各rowをこのキーで判定する)。それでも、途中chunkだけが失敗した
+// 状態でタブが閉じられた場合に毎回全件を送り直すのは非現実的なコストになりうるため、
+// 「どこまでack済みか」をresearchDrawsSyncStatus.ts(ブラウザ内のみの永続化。
+// Experiments側のsubmission_statusやSheets側のdraw_detail_statusとは別物)へ記録し、
+// 次回はその続きから再送する。chunkの成功条件は`received === inserted + duplicates`
+// (docs/apps_script_v3_spec.md 8節3項)であり、HTTPレベルで200が返っただけでは
+// 成功とみなさない。万一ローカルの進捗記録とサーバーの実態がズレても、
+// dedupeキーによりサーバー側で安全に吸収される。
 
 import { listDrawsForExperiment } from "../storage/researchDrawsDb";
 import type { ResearchDrawRecord } from "../storage/researchDrawsDb";
 import { isEndpointConfigured, postToAppsScript } from "./appsScriptEndpoint";
+import { getResearchDrawsSyncStatus, saveResearchDrawsSyncStatus } from "../storage/researchDrawsSyncStatus";
+import type { ResearchDrawsSyncState } from "../storage/researchDrawsSyncStatus";
 
 export const RESEARCH_DRAWS_SCHEMA_VERSION = "research-draw-v2";
 // 通常のchunkサイズ(docs/apps_script_v3_spec.md 3節: 通常250 / 上限500)。
@@ -34,6 +39,21 @@ function buildChunkId(experimentId: string, rows: ResearchDrawRecord[]): string 
   const first = rows[0].draw_index;
   const last = rows[rows.length - 1].draw_index;
   return `${experimentId}:${first}-${last}`;
+}
+
+interface ChunkAck {
+  received: number;
+  inserted: number;
+  duplicates: number;
+}
+
+// Apps Scriptのレスポンス形状を検証する(docs/apps_script_v3_spec.md 4節)。
+// 形が壊れている場合は「成功と確認できない」ものとして扱う(nullを返す)。
+function parseChunkAck(json: unknown): ChunkAck | null {
+  if (!json || typeof json !== "object") return null;
+  const { received, inserted, duplicates } = json as Record<string, unknown>;
+  if (typeof received !== "number" || typeof inserted !== "number" || typeof duplicates !== "number") return null;
+  return { received, inserted, duplicates };
 }
 
 // IndexedDBの内部keyPath("id"、experiment_id::draw_index)は送信ペイロードへ含めない。
@@ -67,21 +87,44 @@ export function isResearchDrawsSubmissionConfigured(): boolean {
   return isEndpointConfigured();
 }
 
-// 指定experiment_idについて、ローカルに記録済みの全visible drawをchunk送信する。
+// 指定experiment_idについて、ローカルに記録済みの未送信visible drawだけをchunk送信する。
 // endpoint未設定ならネットワークアクセスなしで"local_only"を返す。
+// 「どこまで送信済みか」はresearchDrawsSyncStatus.tsへexperiment_id単位で永続化しており、
+// 前回の呼び出しでack済みのdraw_indexより後ろだけを対象にする(再起動を跨いでも再開できる)。
 // chunkのどこかで失敗した場合、それ以降のchunkは送らず即座に失敗を返す
-// (再送時は最初から全chunkを送り直す。dedupeにより既に届いたchunkが重複行を作ることはない)。
+// (次回呼び出し時は失敗したchunk以降だけを送り直す。dedupeにより重複行を作ることはない)。
 export async function syncResearchDrawsForExperiment(experimentId: string): Promise<ResearchDrawsSyncOutcome> {
   if (!isEndpointConfigured()) {
     return { status: "local_only" };
   }
 
   const rows = await listDrawsForExperiment(experimentId);
+  const syncedThroughAtStart = getResearchDrawsSyncStatus(experimentId)?.synced_through_draw_index ?? 0;
+  let syncedThrough = syncedThroughAtStart;
+
+  function persist(state: ResearchDrawsSyncState, error: string | null): void {
+    saveResearchDrawsSyncStatus({
+      experiment_id: experimentId,
+      state,
+      synced_through_draw_index: syncedThrough,
+      last_error: error,
+      updated_at: new Date().toISOString(),
+    });
+  }
+
   if (rows.length === 0) {
+    persist("synced", null);
     return { status: "synced", chunkCount: 0, drawCount: 0 };
   }
 
-  const chunks = chunkArray(rows, RESEARCH_DRAWS_CHUNK_SIZE);
+  const unsent = rows.filter((row) => row.draw_index > syncedThroughAtStart);
+  if (unsent.length === 0) {
+    // 前回までの呼び出しで、記録済みの全drawが既にack済み(=完了済み)。
+    persist("synced", null);
+    return { status: "synced", chunkCount: 0, drawCount: 0 };
+  }
+
+  const chunks = chunkArray(unsent, RESEARCH_DRAWS_CHUNK_SIZE);
   for (let i = 0; i < chunks.length; i++) {
     const chunk = chunks[i];
     // eslint-disable-next-line no-await-in-loop
@@ -92,13 +135,29 @@ export async function syncResearchDrawsForExperiment(experimentId: string): Prom
       chunk_id: buildChunkId(experimentId, chunk),
       draws: chunk.map(toWireDraw),
     });
+
     if (!result.ok) {
+      persist("failed", result.error);
       return { status: "failed", error: result.error, chunkIndex: i, chunkCount: chunks.length };
     }
-    // received/inserted/duplicatesの整合確認(received === inserted + duplicates)は
-    // Apps Script側の責務(docs/apps_script_v3_spec.md 8節)。クライアント側では
-    // HTTPレベルの成否だけを見て、詳細な整合確認はAnalysis時にResearchDrawsの実件数と
-    // Experiments.draw_detail_countを突き合わせて行う。
+
+    // chunk成功条件は`received === inserted + duplicates`(docs/apps_script_v3_spec.md 8節3項)。
+    // HTTP 200が返っただけでは成功とみなさず、この等式が確認できて初めてsynced_through_draw_indexを
+    // 前進させる(進めなければ、次回呼び出し時にこのchunkから送り直される)。
+    const ack = parseChunkAck(result.json);
+    if (!ack || ack.received !== ack.inserted + ack.duplicates) {
+      const error = ack
+        ? `chunk response inconsistent: received=${ack.received} inserted=${ack.inserted} duplicates=${ack.duplicates}`
+        : "invalid chunk response (missing received/inserted/duplicates)";
+      persist("failed", error);
+      return { status: "failed", error, chunkIndex: i, chunkCount: chunks.length };
+    }
+
+    syncedThrough = chunk[chunk.length - 1].draw_index;
+    // まだ残りchunkがあるかもしれない時点でのcheckpoint。ここでタブが閉じられても、
+    // 次回はsynced_through_draw_indexより後ろだけを送り直せばよい。
+    persist(i === chunks.length - 1 ? "synced" : "in_progress", null);
   }
-  return { status: "synced", chunkCount: chunks.length, drawCount: rows.length };
+
+  return { status: "synced", chunkCount: chunks.length, drawCount: unsent.length };
 }
