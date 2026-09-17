@@ -17,13 +17,41 @@ DrawEngine/ProbabilityEngine(app/core)自体はこの一連の作業を通じて
 
 ## 次にやること(このセッションでは着手していない)
 
-1. **Apps Script / Google Sheets対応**(未着手)
-   - クライアント側は準備済み: `services/submissionDto.ts`がExperiments用のフラットなpayloadを作る(target_label_snapshotをそのまま使うため、送信時にdatasetへ依存しない)。
-   - ResearchDraws(IndexedDB)をApps Scriptへ送る経路はまだ無い。1件ずつHTTP通信せず、chunk化して`experiment_id + draw_index`をキーにidempotentな一括送信にする設計方針だけ決まっている(`docs/experiment_ui_flow_spec.md` 6.2節末尾)。実装はまだ。
-   - Apps Script側の現物(受信endpointのコード)を見せてもらってから、Experiments側の列名とDTOの対応・ResearchDraws受信ロジックを詰める。
-2. **Analysis拡張**(未着手)
-   - `docs/experiment_ui_flow_spec.md`のP節(元の指示)に列挙された比較群(理論期待回数vs実際、客観的不運度vs sensor_score、coin消費vs sensor_score/effort_reward_fit_score等)。
-   - 分析の方向性を先に固定せず、まずraw dataの収集を優先する方針。
+### 1. Apps Script / Google Sheets対応(未着手。次セッションの最優先事項)
+
+**現物確認済みの事実(2026-09-18時点)**:
+
+1. Apps Script(`Code.gs`)は現在**Experiments専用**の`doPost`のみで、ResearchDraws用のルーティングは存在しない。
+2. `doPost`はheaderごとに`payload[header]`を読み、`experiment_id`でdedupeして1行書き込む構造。
+3. 旧Target列(shape/primary_effect_id等)が空だった原因は**確定した**: 以前のクライアントは`target`がネストしたobjectのままpayloadに含まれており、`payload.shape`等のフラットなキーが存在しなかったため。**現在の`services/submissionDto.ts`は送信前にflatten済み**なので、このDTOをそのままExperiments行の正として送信してよい(Apps Script側のExperiments処理自体は変更不要、または最小限)。
+4. `success_cdf_at_roll` / `survival_probability_at_cutoff`(Sheets側の既存の派生列)は現在**R1C1の相対参照**で計算されており、v3で列を追加すると参照がずれて壊れる。**header名ベースの参照に書き換える必要がある**。
+5. 既存Sheetsデータは28件前後。**変更・削除・推測backfillは一切しない**(v2以前のレコードにv3の列を後付けで埋めない)。
+6. 既存Experimentsの`experiment_id`によるdedupeロジックは**維持する**(壊さない)。
+7. Google Sheetsのtimezoneが現在`America/Los_Angeles`になっている。**v3の本収集を始める前に`Asia/Tokyo`へ変更する**(タイムスタンプ列の解釈がずれるため、変更後の既存行への影響有無も確認すること)。
+8. Apps Script変更後は**新しいdeploymentが必要**(コード変更だけではWebアプリURLへ反映されない)。
+
+**ResearchDraws受信の設計要件(未実装)**:
+
+- ResearchDraws用の受信ルーティングをdoPostへ追加する(現在はExperiments専用)。
+- chunk送信に対応する: 1 draw = 1 requestにはしない(クライアント側は既に「IndexedDBへローカル保存→chunk化→まとめて送信」の方針)。
+- dedupe keyは**`experiment_id + draw_index`の複合キー**(Experiments側の`experiment_id`単体dedupeとは別ロジックが必要)。
+- 受信したchunkは1行ずつ`appendRow`せず、**まとめて`setValues`で書き込む**(パフォーマンス・API呼び出し回数の観点)。
+- クライアント側(`app/web`)のResearchDraws送信処理自体もまだ実装していない(IndexedDBへの永続化とcheckpointは完了済みだが、Apps Scriptへ送るコードはまだ無い)。`researchSubmission.ts`と同様のパターン(endpoint未設定ならlocal_onlyのまま、送信失敗してもローカルデータは失われない)を踏襲する想定。
+
+**次セッションで最初にやること(この順で設計・実装)**:
+
+1. v3 Experiments schema(現行`Code.gs`のExperiments処理とクライアントの`submissionDto.ts`のフィールド対応を確認し、必要な差分だけ直す)
+2. ResearchDraws schema(Apps Script側のシート構造・列定義)
+3. Apps Scriptのrequest routing(Experiments用とResearchDraws用をdoPost内で振り分ける、またはaction/typeパラメータで分岐する等)
+4. chunk化・idempotency(experiment_id+draw_indexでのdedupe、setValuesでの一括書き込み)
+5. クライアント側のResearchDraws upload実装(chunk化・送信・再送・失敗時のfail-soft)
+
+進める前に、現行`Code.gs`本体と本ファイルを読むこと。
+
+### 2. Analysis拡張(未着手)
+
+- `docs/experiment_ui_flow_spec.md`のP節(元の指示)に列挙された比較群(理論期待回数vs実際、客観的不運度vs sensor_score、coin消費vs sensor_score/effort_reward_fit_score等)。
+- 分析の方向性を先に固定せず、まずraw dataの収集を優先する方針。
 
 ## 触ってはいけないもの
 
