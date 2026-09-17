@@ -21,48 +21,41 @@ DrawEngine/ProbabilityEngine(app/core)自体はこの一連の作業を通じて
 
 ## 次にやること(このセッションでは着手していない)
 
-### 1. Apps Script / Google Sheets対応(未着手。次セッションの最優先事項)
+### 1. Apps Script / Google Sheets対応(実物とのレビュー・統合済み。デプロイはユーザー確認待ち)
 
-**設計contractが確定済み**: リクエスト形式・chunk仕様・dedupeキー・レスポンス形式・Sheet運用・ResearchDrawsの完全性判定(draw_detail_count/draw_detail_statusの扱い含む)まで、`docs/apps_script_v3_spec.md`に合意事項として書き出してある(8節まで完結)。実装前に必ずこのファイルを読むこと(要点は以下にも再掲するが、詳細・JSON例はそちらが正)。
+**2026-09-18: ユーザーから実際に稼働している`Code.gs`全文の提供を受け、それを正本として`apps_script/Code.gs`を書き直した。** 以前のラウンドでは現物を見ずに`docs/apps_script_v3_spec.md`の合意事項だけから書き起こした「リファレンス実装」だったが、今回は実物のロジックをそのまま維持しつつv3を統合した、デプロイ候補と呼べる状態になっている。ただし**まだ本番へは一切反映していない**(ユーザーが確認するまで待つ、という明示の指示があるため)。
 
-**現物確認済みの事実(2026-09-18時点)**:
+**実物のCode.gsから維持したロジック(変更していない)**:
 
-1. Apps Script(`Code.gs`)は現在**Experiments専用**の`doPost`のみで、ResearchDraws用のルーティングは存在しない。
-2. `doPost`はheaderごとに`payload[header]`を読み、`experiment_id`でdedupeして1行書き込む構造。
-3. 旧Target列(shape/primary_effect_id等)が空だった原因は**確定した**: 以前のクライアントは`target`がネストしたobjectのままpayloadに含まれており、`payload.shape`等のフラットなキーが存在しなかったため。**現在の`services/submissionDto.ts`は送信前にflatten済み**なので、このDTOをそのままExperiments行の正として送信してよい(Apps Script側のExperiments処理自体は変更不要、または最小限)。
-4. `success_cdf_at_roll` / `survival_probability_at_cutoff`(Sheets側の既存の派生列)は現在**R1C1の相対参照**で計算されており、v3で列を追加すると参照がずれて壊れる。**header名ベースの参照に書き換える必要がある**。実際の数式テキストが未共有のため、`apps_script/Code.gs`のリファレンス実装にはこの修正は含まれていない。
-5. 既存Sheetsデータは28件前後。**変更・削除・推測backfillは一切しない**(v2以前のレコードにv3の列を後付けで埋めない)。
-6. 既存Experimentsの`experiment_id`によるdedupeロジックは**維持する**(壊さない)。
-7. Google Sheetsのtimezoneが現在`America/Los_Angeles`になっている。**v3の本収集を始める前に`Asia/Tokyo`へ変更する**(タイムスタンプ列の解釈がずれるため、変更後の既存行への影響有無も確認すること)。
-8. Apps Script変更後は**新しいdeploymentが必要**(コード変更だけではWebアプリURLへ反映されない)。
+1. `SPREADSHEET_ID`への`openById`(container-boundではなくID直指定)。
+2. `experiment_id`列を`createTextFinder`+`matchEntireCell`で検索する重複検知。**重複時は上書きせず`{ok:true, duplicate:true, experiment_id}`を返すだけ**(この「上書きしない」という挙動は、以前の想定と違って重要な既存仕様だった)。
+3. 「A列experiment_idが空いている最初の行」を再利用し、無ければ`insertRowAfter`で末尾に追加する行探索ロジック。
+4. `headers.map(header => ...)`による、ヘッダー駆動の値構築(`submission_status`は常に`'sent'`、`submitted_at`は常にサーバー側`new Date()`で上書き、`DERIVED_FIELDS`は常にnull)。
+5. `safeValue_`によるformula injection対策、`LockService`(10秒timeout、`server_busy`)、`doGet`のhealth check。
 
-**このラウンドで追加した成果物と、その既知のギャップ**:
+**v3として統合した差分**:
 
-- `apps_script/Code.gs`(新規): `docs/apps_script_v3_spec.md`の合意事項を書き起こした**リファレンス実装**。**実際のプロジェクトの現行`Code.gs`を直接見て差分を取ったものではない**ため、そのままデプロイせず、既存コードとのマージ・レビューが必須(`apps_script/README.md`に手順あり)。実装内容: `request_type`によるrouting(無指定は`experiment`として後方互換扱い)、Experiments用のheader名ベース読み書き(`ensureHeadersExist`で新規v3列を右側に自動追加)、ResearchDraws用の全rowバリデーション→**1件でも不正なら`setValues`を一切呼ばずchunk全体を失敗させる**書き込み、`experiment_id+draw_index`複合キーでの重複除外、`{ok, received, inserted, duplicates}`レスポンス。
-- `success_cdf_at_roll` / `survival_probability_at_cutoff`のR1C1修正は**未実装**(上記4参照)。
-- クライアント側の`storage/researchDrawsSyncStatus.ts`により、「ResearchDrawsのどこまでApps Scriptへack済みか」はexperiment_id単位でlocalStorageに永続化されるようになった(2026-09-18時点で解消済み)。`App.tsx`起動時の再送は依然としてExperiments側の`submission_status`が`pending`/`failed`のexperiment_idを対象に`syncResearchDrawsForExperiment`を呼ぶヒューリスティックのままだが、その内部では未ack分のchunkだけが実際に再送される。ただし「Experimentsは送信済みだがResearchDrawsだけ未送信」というケースをApps Script側からの応答だけで自動検知して起動時にトリガーする仕組みはまだ無く、その場合は手動で`ResearchHistoryPanel`から再送するか、`getResearchDrawsSyncStatus(experimentId)`を使ってstate!=="synced"のexperiment_idを別途スキャンする対応が必要(現状は実装していない)。
-- 実際のGoogle Apps Scriptエンドポイントに対する送信テストは**本ラウンドでは一切行っていない**(未レビューのスクリプトに本番研究データを送るリスクを避けるため)。ブラウザ確認は`VITE_RESEARCH_ENDPOINT`未設定(`local_only`)の状態でのみ実施し、IndexedDB上の`ResearchDraws`レコード(`coin_cost`/`coin_remaining_after_draw`/`gem_probability_exact`/`gem_surprisal_bits`等)が実値で正しく記録されることを確認した。
+- `doPost`冒頭で`request_type`を見てrouting: `"research_draws_chunk"`なら新設`handleResearchDrawsChunk_`、それ以外(無指定 or `"experiment"`)は従来通り`handleExperiment_`。`request_type`が無い旧POST・新v3 envelope(`{request_type,schema_version,payload}`)の両方に対応。
+- Experiments側は`ensureHeadersExist_`でv3列(下記2節。**`initial_coin`→`coin_initial`に修正、`coin_cost_model_version`/`draw_detail_schema_version`はResearchDraws専用のため削除**)を右側に自動追加してからheader駆動で書き込む(既存43列の削除・並べ替えなし)。
+- 新規`ResearchDraws`シート(無ければ`insertSheet`で作成)。全rowバリデーション→**1件でも不正なら`setValues`を一切呼ばずchunk全体を失敗**、`experiment_id+draw_index`複合キーでの重複除外、`safeValue_`を適用したうえで`setValues`一括書き込み、`{ok, received, inserted, duplicates}`レスポンス。
+- `success_cdf_at_roll` / `survival_probability_at_cutoff`は、ユーザーから提供された実際の数式テキスト(R1C1相対参照)をもとに、header名ベースの絶対参照(`setDerivedFormulas_`)へ書き換えた。
 
-**ResearchDraws受信の設計要件の要点(詳細は`docs/apps_script_v3_spec.md`)**:
+**未解決・要ユーザー確認の1点(最重要)**: 上記の2つの派生列が実際に参照している列(旧`RC[-7]`/`RC[-5]`/`RC[-2]`/`RC[-3]`の指す先)は、数式の構造(`1-(1-p)^n`と`(1-p)^n`という2項分布のCDF/生存関数)とクライアント側`ResearchExperiment`型の既存フィールド名(`theoretical_probability`/`success`/`censored`/`roll_count`/`cutoff_draws`)から**再構成した推測**であり、実際のヘッダー行そのものとは未突き合わせ。`apps_script/Code.gs`に`printDerivedFormulaFieldNames()`(実ヘッダーから参照列名をLoggerへ出力)と`verifyDerivedFormulaMigration()`(既存行について旧式の現在値と新式の計算値を突き合わせ、書き込みは一切しない)という2つの読み取り専用の診断関数を用意したので、**デプロイ前に必ずこの2つをApps Scriptエディタで実行し、`apps_script/README.md`の該当セクションに従って確認すること**。
 
-- POSTに`request_type`を持たせる(`"experiment"` / `"research_draws_chunk"`。`request_type`が無い旧POSTは`experiment`として後方互換的に扱う)。
-- ResearchDrawsは通常250件・上限500件/requestのchunkで送る(`chunk_id`例: `<experiment_id>:1-250`)。dedupeの正本はchunk_idではなく**`experiment_id + draw_index`の複合キー**。
-- 受信したchunkは1行ずつ`appendRow`せず、**まとめて`setValues`で書き込む**。書き込み前に全rowをvalidationし、1件でも不正ならchunk全体を失敗させ`setValues`自体を呼ばない(部分書き込みをしない。再送安全性のため)。
-- chunk成功条件は`received === inserted + duplicates`。
-- レスポンスは最低限`{ ok, received, inserted, duplicates }`を返し、クライアントが送信件数と処理件数の不一致を検知できるようにする。
-- Experimentsの既存`experiment_id`単体dedupeは維持する(ResearchDrawsの複合キーdedupeとは別ロジック)。
-- `draw_detail_status`は永続列として持たない。complete/incompleteはAnalysis時に`ResearchDraws`の`experiment_id`別行数と`Experiments.draw_detail_count`を突き合わせて導出する。
-- 新規`ResearchDraws` tabを作成する(既存Experiments tabは変更しない)。
-- 将来`research_events_chunk`等を追加できるよう`request_type`方式にしておくが、今回はResearchEventsを実装しない。
+**上記以外に確定している事実**:
 
-**次セッションで最初にやること(この順で進める)**:
+- 既存Sheetsデータは28件前後。**変更・削除・推測backfillは一切しない**(v2以前のレコードにv3の列を後付けで埋めない)。この方針は今回の統合でも守られている(既存行のヘッダー・データセルには一切書き込まない)。
+- Google Sheetsのtimezoneが現在`America/Los_Angeles`になっている。**v3の本収集を始める前に`Asia/Tokyo`へ変更する**(タイムスタンプ列の解釈がずれるため、変更後の既存行への影響有無も確認すること)。このスクリプトの範囲外の作業。
+- `appsscript.json`(マニフェスト)の変更は**不要**。`SpreadsheetApp`/`LockService`/`ContentService`/`Logger`のみを使っており、追加のOAuthスコープやトリガー設定を必要としない。
+- Apps Script変更後は**新しいdeploymentが必要**(コード変更だけではWebアプリURLへ反映されない)。
 
-1. `apps_script/Code.gs`を現行の実プロジェクトの`Code.gs`と突き合わせてレビュー・マージする(`apps_script/README.md`のチェックリストに従う)
-2. テスト用スプレッドシートで`doPost`(Experiments・ResearchDraws両方)の動作確認
-3. `success_cdf_at_roll` / `survival_probability_at_cutoff`のR1C1相対参照をheader名ベースの参照へ書き換える(実際の数式テキストを確認してから)
-4. 本番スプレッドシートへ適用し、新しいdeploymentを作成
-5. Spreadsheet timezoneを`America/Los_Angeles`→`Asia/Tokyo`へ変更(v3本収集前。過去のISO timestamp自体は書き換えない)
-6. 実際のエンドポイントに対して`VITE_RESEARCH_ENDPOINT`を設定し、実データでのend-to-end送信確認
+**次にやること(この順で進める)**:
+
+1. Apps Scriptエディタで`printDerivedFormulaFieldNames()` / `verifyDerivedFormulaMigration()`を実行し、`success_cdf_at_roll`/`survival_probability_at_cutoff`の参照列に関する上記推測が正しいか確認する(不一致があれば`Code.gs`冒頭の5定数を実際の列名に合わせて修正する)。
+2. テスト用スプレッドシートで`doPost`(Experiments・ResearchDraws両方、`request_type`無しの旧形式POSTも含む)の動作確認。
+3. 問題なければ`apps_script/Code.gs`を本番のCode.gsへ反映し、新しいdeploymentを作成する。
+4. Spreadsheet timezoneを`America/Los_Angeles`→`Asia/Tokyo`へ変更(v3本収集前。過去のISO timestamp自体は書き換えない)。
+5. 実際のエンドポイントに対して`VITE_RESEARCH_ENDPOINT`を設定し、実データでのend-to-end送信確認。
 
 進める前に、`apps_script/Code.gs`・`apps_script/README.md`・`docs/apps_script_v3_spec.md`・本ファイルを読むこと。
 

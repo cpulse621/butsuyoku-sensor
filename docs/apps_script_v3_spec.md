@@ -6,9 +6,10 @@ Apps Script(`Code.gs`)とクライアント側ResearchDraws送信の設計contra
 
 - **クライアント側(`app/web`)は本仕様に対応済み**: `services/researchSubmission.ts`(Experiments、`request_type: "experiment"`のenvelope)、`services/researchDrawsSubmission.ts`(ResearchDraws、250件/chunkでの`request_type: "research_draws_chunk"`送信)、`services/appsScriptEndpoint.ts`(共通POST処理)。
 - **クライアント側はchunk成功条件`received === inserted + duplicates`をローカルで検証する**: `services/researchDrawsSubmission.ts`はApps Scriptのレスポンスがこの等式を満たした場合のみそのchunkを成功として扱い、`storage/researchDrawsSyncStatus.ts`(ブラウザのlocalStorageのみ、Experimentsの`submission_status`ともSheets側の`draw_detail_status`とも独立)へ「どのdraw_indexまでack済みか」を永続化する。次回`syncResearchDrawsForExperiment`を呼ぶと、そのexperiment_idについて未ack分のchunkだけを送り直す(タブを閉じてもresume可能)。等式が崩れる・レスポンス形状が壊れている場合はHTTP自体が200でも失敗として扱い、進捗を進めない。
-- **Apps Script側は未デプロイ**: `apps_script/Code.gs`に本仕様のリファレンス実装を書き起こしたが、実際のプロジェクトの現行`Code.gs`を直接見て差分マージしたものではない。デプロイ前に必ず`apps_script/README.md`のレビュー手順に従うこと。
-- 実際のGoogle Apps Scriptエンドポイントに対しては本ラウンドでは一切送信していない(未レビューのスクリプトに対して本番の研究データを送るリスクを避けるため)。ブラウザ確認は`VITE_RESEARCH_ENDPOINT`未設定の状態(`local_only`扱い)でのみ行った。
-- `success_cdf_at_roll` / `survival_probability_at_cutoff`のR1C1相対参照修正は、実際の数式を見ていないため`apps_script/Code.gs`に含まれていない。
+- **Apps Script側は実物のCode.gsをベースにレビュー・統合済み、ただしまだ未デプロイ**: ユーザーから実際に稼働している`Code.gs`全文の提供を受け、それを正本として`apps_script/Code.gs`を書き直した(既存のExperiments処理・重複検知・空き行書き込み・`safeValue_`・`LockService`はすべて実物のロジックをそのまま維持)。デプロイ前に必ず`apps_script/README.md`の確認手順(特にsuccess_cdf_at_roll/survival_probability_at_cutoffの参照列を検証する2つの診断関数)に従うこと。
+- 実際のGoogle Apps Scriptエンドポイントに対しては本ラウンドでは一切送信していない(まだユーザーが確認・デプロイしていないスクリプトに対して本番の研究データを送ることになるため)。ブラウザ確認は`VITE_RESEARCH_ENDPOINT`未設定の状態(`local_only`扱い)でのみ行った。
+- `success_cdf_at_roll` / `survival_probability_at_cutoff`のR1C1相対参照は、実際の数式テキストをユーザーから提供を受け、header名ベースの絶対参照へ書き換えた(`apps_script/Code.gs`の`setDerivedFormulas_`)。ただし、その相対参照が実際にどの列名を指していたか自体は、数式の構造(2項分布のCDF/生存関数)とクライアント側の型定義から再構成した推測であり、実ヘッダー行との突き合わせはまだ済んでいない。デプロイ前に`apps_script/README.md`記載の診断関数で確認すること。
+- 以前この節にあったExperiments v3候補列のうち、`initial_coin`は実際のクライアント側フィールド名`coin_initial`の誤記だったため修正した。また`coin_cost_model_version`・`draw_detail_schema_version`はResearchDraws側の列であり、Experimentsの列ではなかったため候補から削除した(下記2節参照)。
 
 ---
 
@@ -19,18 +20,16 @@ Apps Script(`Code.gs`)とクライアント側ResearchDraws送信の設計contra
 研究条件・Target・アンケート・終了結果など、実験全体のsummaryを保存する。
 
 - **既存43列は削除・並べ替えしない**。v3の新規列は原則として右側へ追加する。
-- 追加候補列:
+- 追加候補列(クライアント側`ResearchExperiment`型の実フィールド名と一致させたもの。`coin_cost_model_version`・`draw_detail_schema_version`はResearchDraws側の列でありExperimentsには含めない):
   - `active_duration_ms`
   - `resume_count`
   - `termination_reason`
   - `effort_reward_fit_score`
   - `perceived_expected_draws`
-  - `initial_coin`
+  - `coin_initial`
   - `coin_used`
   - `coin_remaining`
-  - `coin_cost_model_version`
   - `research_protocol_version`
-  - `draw_detail_schema_version`
   - `reveal_mode`
   - `reveal_interval_ms`
   - `draw_detail_count`(意味は8節参照。**ローカルで記録されたvisible ResearchDrawsの期待件数**であり、Apps Scriptへのupload済み件数ではない)
@@ -93,6 +92,7 @@ Apps Script(`Code.gs`)とクライアント側ResearchDraws送信の設計contra
 ```
 
 - 後方互換性のため、`request_type`が無い旧POSTは`experiment`として扱う。
+- Experimentsのレスポンス形状は実物`Code.gs`の既存挙動をそのまま維持する: 成功時`{ok:true, duplicate:false, experiment_id, row}`、既存experiment_idと重複時`{ok:true, duplicate:true, experiment_id}`(上書きはしない)、エラー時`{ok:false, error}`。クライアント側はHTTPレベルの成否のみを見るため、この形状に依存していない。
 
 ---
 
