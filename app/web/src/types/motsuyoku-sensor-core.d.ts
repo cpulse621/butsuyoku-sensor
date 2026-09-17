@@ -196,6 +196,14 @@ declare module "motsuyoku-sensor-core" {
 
   export function validateTarget(dataset: GemDataset, target: TargetBloodGem): void;
   export function computeProbability(dataset: GemDataset, target: TargetBloodGem): ProbabilityResult;
+  // そのgem自身(の組み合わせぴったり)が出る確率。既存のcomputeProbabilityを
+  // 単一値のTargetBloodGemで呼ぶだけの派生ヘルパー(新しい確率モデルの追加ではない)。
+  export function computeGemProbability(dataset: GemDataset, gem: BloodGem): ProbabilityResult;
+
+  // dataset全体の全canonical組み合わせとその正確なpを列挙する(p=0のものは除外済み)。
+  export function enumerateGemProbabilities(dataset: GemDataset): { gem: BloodGem; p: number }[];
+  // dataset全体のShannon entropy(bits/draw)。コインコスト式Dの分母として使う想定。
+  export function computeDatasetEntropyBits(dataset: GemDataset): number;
 
   // ---- TargetMatcher (spec 6節) ----
   export function isMatch(gem: BloodGem, target: TargetBloodGem): boolean;

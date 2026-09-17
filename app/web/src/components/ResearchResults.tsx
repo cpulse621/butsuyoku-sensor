@@ -35,6 +35,8 @@ export function ResearchResults({ record, probability, onStartNew, onResend }: P
       <div className="result-status">
         {record.success ? (
           <span className="result-status__badge result-status__badge--success">目的の血晶が出ました</span>
+        ) : record.termination_reason === "coin_exhausted" ? (
+          <span className="result-status__badge result-status__badge--censored">コインが尽きました（未達成）</span>
         ) : (
           <span className="result-status__badge result-status__badge--censored">途中で終了しました（未達成）</span>
         )}
@@ -71,6 +73,16 @@ export function ResearchResults({ record, probability, onStartNew, onResend }: P
           <tr>
             <td>進行方式</td>
             <td>{drawAdvanceModeLabel(record.draw_advance_mode)}</td>
+          </tr>
+          <tr>
+            <td>使用コイン</td>
+            <td>{record.coin_used.toLocaleString("ja-JP")}</td>
+          </tr>
+          <tr>
+            <td>残りコイン</td>
+            <td>
+              {record.coin_remaining.toLocaleString("ja-JP")} / {record.coin_initial.toLocaleString("ja-JP")}
+            </td>
           </tr>
           {record.draw_advance_mode === "auto" && (
             <tr>
@@ -120,6 +132,22 @@ export function ResearchResults({ record, probability, onStartNew, onResend }: P
             <tr>
               <td>物欲センサーの実感</td>
               <td>{record.sensor_score} / 5</td>
+            </tr>
+          )}
+          {record.effort_reward_fit_score !== null && (
+            <tr>
+              <td>結果は手間に見合っていたか</td>
+              <td>{record.effort_reward_fit_score} / 5</td>
+            </tr>
+          )}
+          {record.perceived_expected_draws !== null && (
+            <tr>
+              <td>体感での「何回に1回」</td>
+              <td>
+                約{record.perceived_expected_draws.toLocaleString("ja-JP")}回に1回
+                {" "}
+                (理論値: {formatOneInN(probability.approxOneInN)})
+              </td>
             </tr>
           )}
         </tbody>

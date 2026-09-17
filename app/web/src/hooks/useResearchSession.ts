@@ -1,14 +1,30 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import type { BloodGem, GemDataset, ProbabilityResult, TargetBloodGem } from "motsuyoku-sensor-core";
-import { GemDatasets, ResearchModePhases, createDefaultRng, createResearchModeSession } from "motsuyoku-sensor-core";
+import {
+  GemDatasets,
+  ResearchModePhases,
+  createDefaultRng,
+  createResearchModeSession,
+  computeGemProbability,
+  computeDatasetEntropyBits,
+} from "motsuyoku-sensor-core";
 import * as researchStore from "../storage/researchHistory";
-import type { ActiveExperimentSnapshot, DrawAdvanceMode, ExitReason, ResearchExperiment } from "../storage/researchHistory";
-import { toStoredTarget, storedTargetToTarget } from "../lib/targetSummary";
+import type { ActiveExperimentSnapshot, DrawAdvanceMode, ExitReason, ResearchExperiment, TerminationReason } from "../storage/researchHistory";
+import { RESEARCH_PROTOCOL_VERSION, REVEAL_MODE } from "../storage/researchHistory";
+import * as researchDrawsDb from "../storage/researchDrawsDb";
+import { DRAW_DETAIL_SCHEMA_VERSION } from "../storage/researchDrawsDb";
+import { toStoredTarget, storedTargetToTarget, buildTargetLabelSnapshot } from "../lib/targetSummary";
+import type { TargetLabelSnapshot } from "../lib/targetSummary";
 import { attemptSubmission, isSubmissionConfigured } from "../services/researchSubmission";
+import type { SurveyFormAnswers } from "../components/SurveyForm";
+import { COIN_COST_MODEL_VERSION, COIN_COST_OPTIONS, INITIAL_COIN, computeNormalizedSurprisalCost } from "../lib/coinCost";
+import webPackageJson from "../../package.json";
 
 // app/core/package.json のバージョンをそのまま研究ログのengine_versionとして使う
 // (Coreは変更していないため、ここは既知の実値であり創作ではない)。
 const ENGINE_VERSION = "motsuyoku-sensor-core@0.1.0";
+// app/web/package.jsonのversionをそのままapp_versionとして使う(捏造しない既知の実値)。
+const APP_VERSION: string = webPackageJson.version;
 
 // 1件あたりの結果表示間隔。派手なガチャ演出ではなく「個々の結果(特に外れ)を
 // 参加者が認識できること」が目的のため、控えめな値を定数として分離しておく。
@@ -31,22 +47,40 @@ export type UiPhase = "idle" | "running" | "awaiting_survey" | "awaiting_exit_re
 
 export interface RevealedEntry {
   gem: BloodGem;
-  rollCount: number;
+  rollCount: number; // 実験全体を通した絶対通し番号(resumeを跨いでも連続。Core内部の相対値ではない)
   matched: boolean;
 }
 
-export interface SurveyAnswers {
-  tediousnessScore: 1 | 2 | 3 | 4 | 5;
-  painIfRepeatedScore: 1 | 2 | 3 | 4 | 5;
-  sensorScore: 1 | 2 | 3 | 4 | 5;
-}
+export type SurveyAnswers = SurveyFormAnswers;
 
 type CoreSession = ReturnType<typeof createResearchModeSession>;
+
+interface ResumeOffsets {
+  rollOffset: number;
+  batchOffset: number;
+  activeMsBase: number;
+  pauseCount: number;
+  pausedDurationMs: number;
+  resumeCount: number;
+  // ResearchDraws最終行のcoin_remaining_after_drawから復元する(正本)。
+  coinRemaining: number;
+}
 
 // 研究モードのExperiment Flow(画面遷移・累計roll_count・survey gating)は、
 // Core(app/core/src/state/researchModeState.js)がすでに実装済みのため、それをそのまま使う。
 // このhookはCoreセッションのReact向けラッパーと、実験結果のlocalStorage保存(researchHistory.ts)
-// ・reload復旧(active experiment)・manual/auto進行・途中終了時アンケートのオーケストレーションを担当する。
+// ・ResearchDraws(IndexedDB)への1 visible draw = 1 recordの永続化・reload復旧(resume案A:
+// Core自体は変更せず、Web側で実験全体を通した絶対draw_index/batch_indexのoffsetを管理する)
+// ・manual/auto進行・途中終了時アンケートのオーケストレーションを担当する。
+//
+// resume(案A)の設計:
+// CoreのcreateResearchModeSession()はクロージャ内部に乱数消費位置・pendingBatch等を持ち、
+// シリアライズできない。そのためreload後は新しいCoreセッションを作り直す(Core内部の
+// 未提示pending batchは破棄してよい: 参加者に見せていないdrawは研究データではないため)。
+// ただし「これまでに確定済みの絶対roll数」はResearchDraws(IndexedDB)を正本として復元し、
+// 新しいCoreセッションが返す相対rollCountにこのoffsetを足すことで、roll_count/cutoff_drawsが
+// 0に戻らないようにする。各visible drawが提示された時点でResearchDrawsへ都度チェックポイントする
+// ため、reload直前に提示済みだったdrawが失われることはない。
 //
 // 途中終了(give up)時もCoreの giveUp() を「即座には」呼ばない点に注意:
 // Coreの giveUp() は RUNNING → REVEALED (survey無し) へ直接遷移する設計だが、
@@ -56,7 +90,7 @@ type CoreSession = ReturnType<typeof createResearchModeSession>;
 // giveUp()を呼ぶまでの間はCore側のphaseはRUNNINGのままだが、revealBatch/自動進行はどちらも
 // 独自のuiPhaseガードで停止するため、Coreの抽選が余分に進むことはない。
 export function useResearchSession() {
-  const [uiPhase, setUiPhase] = useState<UiPhase>("idle");
+  const [uiPhase, setUiPhaseState] = useState<UiPhase>("idle");
   const [rollCount, setRollCount] = useState(0);
   const [currentBatchRevealed, setCurrentBatchRevealed] = useState<RevealedEntry[]>([]);
   const [isRevealing, setIsRevealing] = useState(false);
@@ -75,6 +109,15 @@ export function useResearchSession() {
   const [elapsedMs, setElapsedMs] = useState(0);
   const [isRetiring, setIsRetiring] = useState(false); // 途中終了操作中(survey/退出理由待ち)かどうか。UIでTarget再編集不可の判定等に使う。
 
+  // コイン(有限resource/cost体験)。表示用にstateとして持つが、revealBatchループ内で
+  // 即座に増減判定(exhaustion検出)する必要があるため、真の値はrefで管理しstateは表示専用とする。
+  // coinRemainingRef自体は0未満(負)にもなりうる(オーバーシュートの監査用)が、
+  // 表示・レコード上のcoin_remainingは常に0でclampする。
+  const coinRemainingRef = useRef(INITIAL_COIN);
+  const [coinRemaining, setCoinRemaining] = useState(INITIAL_COIN);
+  // coinが尽きたことでawaiting_surveyへ進んだ(=Target Matchでもparticipant_giveupでもない)ことを示す。
+  const pendingCoinExhaustedRef = useRef(false);
+
   // manual/auto(研究条件)
   const [drawAdvanceMode, setDrawAdvanceMode] = useState<DrawAdvanceMode | null>(null);
   const [autoRemainingMs, setAutoRemainingMs] = useState(0);
@@ -84,6 +127,22 @@ export function useResearchSession() {
   //  古いままになるため、常に最新値を読めるrefを使う。)
   const pauseCountRef = useRef(0);
   const pausedDurationMsRef = useRef(0);
+  const resumeCountRef = useRef(0);
+
+  // uiPhase/isAutoPausedの「今この瞬間の値」をactive時間トラッキング(下記)から
+  // 同期的に読むためのref。setState経由のeffectだと1レンダー遅れる可能性があるため、
+  // 値を変更する側(setPhase/pauseAuto/resumeAuto)で直接書き込む。
+  const uiPhaseRef = useRef<UiPhase>("idle");
+  const isAutoPausedRef = useRef(false);
+  const isTabVisibleRef = useRef(typeof document === "undefined" ? true : !document.hidden);
+
+  // 「参加者が実際に画面上で活動していた累積時間」(active_elapsed_ms/active_duration_ms)の
+  // トラッキング。画面を離れていた時間を「抽選作業をしていた時間」と誤認しないための指標。
+  // running中・タブが可視・auto一時停止中でない、の3条件がすべて揃っている間だけ加算する。
+  // resume時はactiveMsBaseRefへ前回チェックポイント(ResearchDrawsの最終行)の値を積む。
+  const activeMsBaseRef = useRef(0);
+  const activeAccumulatedRef = useRef(0);
+  const activePeriodStartRef = useRef<number | null>(null);
 
   const [resumeSnapshot] = useState<ActiveExperimentSnapshot | null>(() => researchStore.loadActiveExperiment());
   const [resumeHandled, setResumeHandled] = useState(false);
@@ -94,17 +153,69 @@ export function useResearchSession() {
     participantId: string;
     dataset: GemDataset;
     target: TargetBloodGem;
+    // TargetがLOCKされる実験開始時点で1回だけ計算し、以後は再計算しない
+    // (指示1節: deployment/data_version/i18n更新後も実験開始時点の表示内容を変えないため)。
+    targetLabelSnapshot: TargetLabelSnapshot;
+    desireScore: 1 | 2 | 3 | 4 | 5;
     startedAtMs: number;
-    batchCount: number;
+    batchCount: number; // 絶対batch_index(resumeを跨いでも継続)
     drawAdvanceMode: DrawAdvanceMode;
     autoIntervalMs: number | null; // 実験開始時に1回だけ決めた値。実験中は不変。
+    rollOffset: number; // このCoreセッション開始前までに確定済みだった絶対roll数
+    // datasetのShannon entropy(bits/draw)。coinコスト式Dの分母。datasetは実験中不変のため、
+    // beginSession時に1回だけ計算してキャッシュする(毎drawで再列挙しない)。
+    datasetEntropyBits: number;
   } | null>(null);
   const pendingGiveUpRef = useRef(false);
   const pendingSurveyAnswersRef = useRef<SurveyAnswers | null>(null);
   const pauseStartedAtRef = useRef<number | null>(null);
   const stopRequestedRef = useRef(false);
 
-  // 実験中は「経過時間」表示のために1秒ごとに再計算する。
+  function startActivePeriodIfNeeded() {
+    if (activePeriodStartRef.current === null) activePeriodStartRef.current = Date.now();
+  }
+  function stopActivePeriodIfNeeded() {
+    if (activePeriodStartRef.current !== null) {
+      activeAccumulatedRef.current += Date.now() - activePeriodStartRef.current;
+      activePeriodStartRef.current = null;
+    }
+  }
+  function getActiveMsNow(): number {
+    const runningMs = activePeriodStartRef.current !== null ? Date.now() - activePeriodStartRef.current : 0;
+    return activeMsBaseRef.current + activeAccumulatedRef.current + runningMs;
+  }
+  function shouldBeActiveNow(): boolean {
+    return (
+      uiPhaseRef.current === "running" &&
+      isTabVisibleRef.current &&
+      !(metaRef.current?.drawAdvanceMode === "auto" && isAutoPausedRef.current)
+    );
+  }
+  function syncActivePeriod() {
+    if (shouldBeActiveNow()) startActivePeriodIfNeeded();
+    else stopActivePeriodIfNeeded();
+  }
+  // uiPhaseの変更は必ずこのヘルパー経由で行う(refとstateを同時に更新し、
+  // active時間トラッキングを常に最新のphaseへ同期させるため)。
+  function setPhase(next: UiPhase) {
+    uiPhaseRef.current = next;
+    setUiPhaseState(next);
+    syncActivePeriod();
+  }
+
+  // タブが非表示(バックグラウンド化)されている間はactive時間を進めない。
+  useEffect(() => {
+    function handleVisibilityChange() {
+      isTabVisibleRef.current = !document.hidden;
+      syncActivePeriod();
+    }
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    return () => document.removeEventListener("visibilitychange", handleVisibilityChange);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 実験中は「経過時間」表示のために1秒ごとに再計算する(壁時計。resume後も
+  // 元のstarted_atからの経過をそのまま表示する。active_duration_msとは別の指標)。
   useEffect(() => {
     if (uiPhase !== "running") return;
     const id = window.setInterval(() => {
@@ -122,6 +233,32 @@ export function useResearchSession() {
     return () => window.clearTimeout(id);
   }, [resumedProgressReset]);
 
+  // pause_count/paused_duration_ms/resume_count・target_label_snapshotなど、
+  // ResearchDraws(正本)には無いresume用の補助情報だけをlocalStorageへ書き戻す。
+  // roll_offset/batch_offset/active_elapsed_msはResearchDrawsの最終行から復元するため、
+  // ここには含めない。target_label_snapshotは実験開始時点で確定済みの値をそのまま運ぶだけで、
+  // ここで再計算はしない(指示1節)。
+  function persistActiveSnapshot() {
+    const meta = metaRef.current;
+    if (!meta) return;
+    researchStore.saveActiveExperiment({
+      experiment_id: meta.experimentId,
+      participant_id: meta.participantId,
+      started_at: new Date(meta.startedAtMs).toISOString(),
+      dataset_id: meta.dataset.datasetId,
+      enemy_id: meta.dataset.enemy.enemyId,
+      enemy_display_name: meta.dataset.enemy.displayName,
+      target: toStoredTarget(meta.target),
+      target_label_snapshot: meta.targetLabelSnapshot,
+      desire_score: meta.desireScore,
+      draw_advance_mode: meta.drawAdvanceMode,
+      auto_interval_ms: meta.autoIntervalMs,
+      pause_count: pauseCountRef.current,
+      paused_duration_ms: pausedDurationMsRef.current,
+      resume_count: resumeCountRef.current,
+    });
+  }
+
   function beginSession(
     dataset: GemDataset,
     target: TargetBloodGem,
@@ -131,44 +268,67 @@ export function useResearchSession() {
     startedAtMs: number,
     mode: DrawAdvanceMode,
     autoIntervalMs: number | null,
-    resumed: boolean
+    resumed: boolean,
+    resumeOffsets: ResumeOffsets | null,
+    // resume時は実験開始時点で確定したsnapshotをそのまま引き継ぐ(再計算しない)。
+    // 新規実験の場合はここで(TargetがLOCKされるこの瞬間に)1回だけ計算する。
+    existingTargetLabelSnapshot: TargetLabelSnapshot | null
   ) {
     const session = createResearchModeSession({ dataset, target, desireScore, rng: createDefaultRng() });
     session.start();
     sessionRef.current = session;
-    metaRef.current = { experimentId, participantId, dataset, target, startedAtMs, batchCount: 0, drawAdvanceMode: mode, autoIntervalMs };
+
+    const rollOffset = resumeOffsets?.rollOffset ?? 0;
+    const batchOffset = resumeOffsets?.batchOffset ?? 0;
+    const targetLabelSnapshot = existingTargetLabelSnapshot ?? buildTargetLabelSnapshot(dataset, target);
+    const datasetEntropyBits = computeDatasetEntropyBits(dataset);
+
+    metaRef.current = {
+      experimentId,
+      participantId,
+      dataset,
+      target,
+      targetLabelSnapshot,
+      desireScore,
+      startedAtMs,
+      batchCount: batchOffset,
+      drawAdvanceMode: mode,
+      autoIntervalMs,
+      rollOffset,
+      datasetEntropyBits,
+    };
     pendingGiveUpRef.current = false;
+    pendingCoinExhaustedRef.current = false;
     pendingSurveyAnswersRef.current = null;
     pauseStartedAtRef.current = null;
     stopRequestedRef.current = false;
     isRevealingRef.current = false;
 
-    researchStore.saveActiveExperiment({
-      experiment_id: experimentId,
-      participant_id: participantId,
-      started_at: new Date(startedAtMs).toISOString(),
-      dataset_id: dataset.datasetId,
-      enemy_id: dataset.enemy.enemyId,
-      enemy_display_name: dataset.enemy.displayName,
-      target: toStoredTarget(target),
-      desire_score: desireScore,
-      draw_advance_mode: mode,
-      auto_interval_ms: autoIntervalMs,
-    });
+    activeMsBaseRef.current = resumeOffsets?.activeMsBase ?? 0;
+    activeAccumulatedRef.current = 0;
+    activePeriodStartRef.current = null;
 
+    pauseCountRef.current = resumeOffsets?.pauseCount ?? 0;
+    pausedDurationMsRef.current = resumeOffsets?.pausedDurationMs ?? 0;
+    resumeCountRef.current = resumeOffsets?.resumeCount ?? 0;
+
+    coinRemainingRef.current = resumeOffsets?.coinRemaining ?? INITIAL_COIN;
+    setCoinRemaining(Math.max(0, coinRemainingRef.current));
+
+    isAutoPausedRef.current = false;
+    setIsAutoPaused(false);
     setDrawAdvanceMode(mode);
     setAutoRemainingMs(autoIntervalMs ?? 0);
-    setIsAutoPaused(false);
-    pauseCountRef.current = 0;
-    pausedDurationMsRef.current = 0;
     setResumedProgressReset(resumed);
-    setRollCount(0);
+    setRollCount(rollOffset);
     setCurrentBatchRevealed([]);
     setIsRevealing(false);
-    setElapsedMs(0);
+    setElapsedMs(Date.now() - startedAtMs);
     setIsRetiring(false);
     setSaveError(null);
-    setUiPhase("running");
+
+    persistActiveSnapshot();
+    setPhase("running");
   }
 
   const startExperiment = useCallback((dataset: GemDataset, target: TargetBloodGem, desireScore: 1 | 2 | 3 | 4 | 5) => {
@@ -177,14 +337,15 @@ export function useResearchSession() {
     // 参加者には選択させず、実験開始時にランダムへ割り当てる(比較したい要因: 次の10連を自分でクリックするかどうか)。
     const mode: DrawAdvanceMode = Math.random() < 0.5 ? "manual" : "auto";
     const autoIntervalMs = mode === "auto" ? pickAutoIntervalMs() : null;
-    beginSession(dataset, target, desireScore, experimentId, participantId, Date.now(), mode, autoIntervalMs, false);
+    beginSession(dataset, target, desireScore, experimentId, participantId, Date.now(), mode, autoIntervalMs, false, null, null);
   }, []);
 
-  // reload後、activeExperimentスナップショットから再開する。
+  // reload後、activeExperimentスナップショット+ResearchDraws(正本)から再開する。
   // Coreセッションの内部状態(乱数消費位置等)はシリアライズできないため、新しいCoreセッションを
-  // 作り直す形になる(roll_count・経過時間・一時停止回数は0から)。draw_advance_modeは
+  // 作り直す形になるが、roll_count/batch_count/active_elapsed_msはResearchDrawsに保存済みの
+  // 最後のvisible drawから復元するため、0に戻らない。draw_advance_mode/auto_interval_msは
   // 元の割り当てをそのまま引き継ぐ(再度ランダム化はしない)。
-  const resumeExperiment = useCallback(() => {
+  const resumeExperiment = useCallback(async () => {
     if (!resumeSnapshot) return;
     const dataset = GemDatasets[resumeSnapshot.dataset_id];
     if (!dataset) {
@@ -193,6 +354,27 @@ export function useResearchSession() {
       return;
     }
     const target = storedTargetToTarget(dataset.datasetId, resumeSnapshot.target);
+
+    let lastDraw: researchDrawsDb.ResearchDrawRecord | null = null;
+    try {
+      lastDraw = await researchDrawsDb.getLastDrawForExperiment(resumeSnapshot.experiment_id);
+    } catch {
+      // IndexedDBが読めない場合でも「0件からの再開」として続行できるようにする
+      // (研究データの継続収集を、ストレージ不調で完全に止めないためのfail-soft)。
+      lastDraw = null;
+    }
+
+    const resumeOffsets: ResumeOffsets = {
+      rollOffset: lastDraw?.draw_index ?? 0,
+      batchOffset: lastDraw?.batch_index ?? 0,
+      activeMsBase: lastDraw?.active_elapsed_ms ?? 0,
+      pauseCount: resumeSnapshot.pause_count ?? 0,
+      pausedDurationMs: resumeSnapshot.paused_duration_ms ?? 0,
+      resumeCount: (resumeSnapshot.resume_count ?? 0) + 1,
+      // ResearchDraws最終行のcoin_remaining_after_drawを正本として復元する(未記録ならINITIAL_COIN)。
+      coinRemaining: lastDraw?.coin_remaining_after_draw ?? INITIAL_COIN,
+    };
+
     beginSession(
       dataset,
       target,
@@ -202,7 +384,11 @@ export function useResearchSession() {
       new Date(resumeSnapshot.started_at).getTime(),
       resumeSnapshot.draw_advance_mode,
       resumeSnapshot.auto_interval_ms, // 元の割り当てをそのまま引き継ぐ(再度ランダム化しない)
-      true
+      true,
+      resumeOffsets,
+      // このsnapshot導入より前に保存されたactiveExperimentには無い可能性があるため、
+      // その場合のみfail-softに現在のdatasetから計算する(通常は実験開始時点の値をそのまま使う)。
+      resumeSnapshot.target_label_snapshot ?? null
     );
     setResumeHandled(true);
   }, [resumeSnapshot]);
@@ -216,11 +402,16 @@ export function useResearchSession() {
   // Core側は内部で10件生成するが、画面へは1件ずつ(REVEAL_ITEM_DELAY_MS間隔で)提示する。
   // 「また外れた」を個々に認識できることが目的で、一気に10件出す演出はしない。
   // isRevealingRef(連打・auto二重発火防止)は、全件の提示が完了するまで次のバッチを一切開始させない。
+  //
+  // 各visible drawが画面へ出た直後に、ResearchDraws(IndexedDB)へ即座にappendDraw()する
+  // (指示: 「reload直前に提示済みだったdrawが失われないように」10連の完了を待たずcheckpointする)。
   const revealBatch = useCallback(async () => {
     if (isRevealingRef.current) return; // 表示中の連打・二重発火を防ぐ(10件の提示完了まで次を開始しない)
     const session = sessionRef.current;
-    if (!session || uiPhase !== "running") return;
-    if (metaRef.current) metaRef.current.batchCount += 1;
+    const meta = metaRef.current;
+    if (!session || !meta || uiPhase !== "running") return;
+    meta.batchCount += 1;
+    const batchIndex = meta.batchCount;
     stopRequestedRef.current = false;
 
     isRevealingRef.current = true;
@@ -231,12 +422,61 @@ export function useResearchSession() {
     for (let i = 0; i < 10; i++) {
       if (stopRequestedRef.current) break; // 途中終了ボタンが押された→未表示分は追加表示しない
       if (session.phase !== ResearchModePhases.RUNNING) break;
-      const { gem, rollCount: newRollCount, matched } = session.revealNext();
-      const entry: RevealedEntry = { gem, rollCount: newRollCount, matched };
+      const { gem, rollCount: relativeRollCount, matched } = session.revealNext();
+      const absoluteRollCount = meta.rollOffset + relativeRollCount;
+      const entry: RevealedEntry = { gem, rollCount: absoluteRollCount, matched };
       revealedThisBatch.push(entry);
       setCurrentBatchRevealed([...revealedThisBatch]);
-      setRollCount(newRollCount);
-      if (matched) break; // Target Match: ここで停止し、残りは参加者に見せない(roll_countも増やさない)
+      setRollCount(absoluteRollCount);
+
+      const activeElapsedMs = getActiveMsNow();
+      const wallElapsedMs = Date.now() - meta.startedAtMs;
+      // 確率監査用スナップショット: coin_costがdrawそのものの確率に依存するため、
+      // 「なぜこのdrawでこのcoin_costだったか」を将来再計算できるよう、実際に出たgemの
+      // 正確な確率とsurprisal(bit)を常時保存しておく。
+      const { p: gemProbabilityExact } = computeGemProbability(meta.dataset, gem);
+      const gemSurprisalBits = -Math.log2(gemProbabilityExact);
+      // coin(有限resource/cost体験)を消費する。確定したproduction設定(COIN_COST_OPTIONS)を
+      // 唯一の定義元として参照し、ここへ式やパラメータをハードコードしない。
+      const coinCost = computeNormalizedSurprisalCost(gemProbabilityExact, meta.datasetEntropyBits, COIN_COST_OPTIONS);
+      coinRemainingRef.current -= coinCost;
+      setCoinRemaining(Math.max(0, coinRemainingRef.current));
+
+      void researchDrawsDb
+        .appendDraw({
+          experiment_id: meta.experimentId,
+          draw_index: absoluteRollCount,
+          batch_index: batchIndex,
+          active_elapsed_ms: activeElapsedMs,
+          wall_elapsed_ms: wallElapsedMs,
+          dataset_id: meta.dataset.datasetId,
+          shape_id: gem.shapeId,
+          primary_effect_id: gem.primaryEffectId,
+          primary_value_rank: gem.primaryValueRank,
+          secondary_effect_id: gem.secondaryEffectId,
+          secondary_value_rank: gem.secondaryValueRank,
+          curse_id: gem.curseId,
+          target_match: matched,
+          gem_probability_exact: gemProbabilityExact,
+          gem_surprisal_bits: gemSurprisalBits,
+          coin_cost: coinCost,
+          coin_remaining_after_draw: coinRemainingRef.current,
+          coin_cost_model_version: COIN_COST_MODEL_VERSION,
+          draw_detail_schema_version: DRAW_DETAIL_SCHEMA_VERSION,
+        })
+        .catch(() => {
+          // IndexedDB書き込み失敗はUIをクラッシュさせない(fail-soft)。
+          // resumeのroll_offsetがこの1件分ずれる可能性はあるが、実験の続行自体は妨げない。
+        });
+      persistActiveSnapshot(); // pause関連の補助情報をこまめにcheckpointする
+
+      if (matched) break; // Target Match: ここで停止し、残りは参加者に見せない(roll_countも増やさない)。coin exhaustionより優先する。
+      if (coinRemainingRef.current <= 0) {
+        // coin <= 0 かつTarget未達: ここで停止し、事後アンケートへ進む(参加者の任意終了とは区別する)。
+        pendingCoinExhaustedRef.current = true;
+        stopRequestedRef.current = true;
+        break;
+      }
       // eslint-disable-next-line no-await-in-loop
       await new Promise((resolve) => window.setTimeout(resolve, REVEAL_ITEM_DELAY_MS));
       if (stopRequestedRef.current) break; // 待機中に途中終了された場合も、直後の1件を出さずに止める
@@ -245,11 +485,11 @@ export function useResearchSession() {
     isRevealingRef.current = false;
     setIsRevealing(false);
     const phaseAfterBatch: string = session.phase;
-    if (phaseAfterBatch === ResearchModePhases.AWAITING_SURVEY) {
-      setUiPhase("awaiting_survey");
-    } else if (metaRef.current?.drawAdvanceMode === "auto" && !stopRequestedRef.current) {
+    if (phaseAfterBatch === ResearchModePhases.AWAITING_SURVEY || pendingCoinExhaustedRef.current) {
+      setPhase("awaiting_survey");
+    } else if (meta.drawAdvanceMode === "auto" && !stopRequestedRef.current) {
       // MATCHなし・途中終了もされなかった場合のみ、全件表示完了後に次のバッチへ向けて再カウントダウンを始める。
-      setAutoRemainingMs(metaRef.current.autoIntervalMs ?? 0);
+      setAutoRemainingMs(meta.autoIntervalMs ?? 0);
     }
   }, [uiPhase]);
 
@@ -275,6 +515,9 @@ export function useResearchSession() {
       if (was) return was;
       pauseStartedAtRef.current = Date.now();
       pauseCountRef.current += 1;
+      isAutoPausedRef.current = true;
+      syncActivePeriod();
+      persistActiveSnapshot();
       return true;
     });
   }, [drawAdvanceMode]);
@@ -287,11 +530,17 @@ export function useResearchSession() {
         pausedDurationMsRef.current += Date.now() - pauseStartedAtRef.current;
         pauseStartedAtRef.current = null;
       }
+      isAutoPausedRef.current = false;
+      syncActivePeriod();
+      persistActiveSnapshot();
       return false;
     });
   }, [drawAdvanceMode]);
 
-  function finalize(session: CoreSession, extra: { surveyAnswers: SurveyAnswers | null; exitReason: ExitReason | null }) {
+  function finalize(
+    session: CoreSession,
+    extra: { surveyAnswers: SurveyAnswers | null; exitReason: ExitReason | null; terminationReason: TerminationReason }
+  ) {
     const summary = session.getSummary();
     const meta = metaRef.current;
     if (!meta) return;
@@ -309,6 +558,9 @@ export function useResearchSession() {
       pauseStartedAtRef.current = null;
     }
 
+    const absoluteRollCountAtEnd = meta.rollOffset + summary.rollCount;
+    const activeDurationMs = getActiveMsNow();
+
     const record: ResearchExperiment = {
       experiment_id: meta.experimentId,
       participant_id: meta.participantId,
@@ -319,11 +571,15 @@ export function useResearchSession() {
       enemy_id: meta.dataset.enemy.enemyId,
       enemy_display_name: meta.dataset.enemy.displayName,
       target: toStoredTarget(meta.target),
-      desire_score: summary.desireScore,
+      // TargetがLOCKされた実験開始時点(beginSession)で既に計算済みの値をそのままコピーするだけ。
+      // ここで現在のdatasetから再計算はしない(指示1節: 実験開始後にdeployment/data_version/i18nが
+      // 更新されても、実験開始時点の表示内容が変わらないようにするため)。
+      target_label_snapshot: meta.targetLabelSnapshot,
+      desire_score: meta.desireScore,
       success: summary.matched,
       censored: summary.censored,
-      roll_count: summary.matched ? summary.rollCount : null,
-      cutoff_draws: summary.censored ? summary.rollCount : null,
+      roll_count: summary.matched ? absoluteRollCountAtEnd : null,
+      cutoff_draws: summary.censored ? absoluteRollCountAtEnd : null,
       batch_count: meta.batchCount,
       draw_advance_mode: meta.drawAdvanceMode,
       auto_interval_ms: meta.autoIntervalMs,
@@ -334,9 +590,26 @@ export function useResearchSession() {
       tedious_score: extra.surveyAnswers?.tediousnessScore ?? null,
       real_game_burden_score: extra.surveyAnswers?.painIfRepeatedScore ?? null,
       sensor_score: extra.surveyAnswers?.sensorScore ?? null,
+      effort_reward_fit_score: extra.surveyAnswers?.effortRewardFitScore ?? null,
+      perceived_expected_draws: extra.surveyAnswers?.perceivedExpectedDraws ?? null,
       exit_reason: extra.exitReason,
+      termination_reason: extra.terminationReason,
       engine_version: ENGINE_VERSION,
       data_version: meta.dataset.dataVersion,
+      app_version: APP_VERSION,
+      research_protocol_version: RESEARCH_PROTOCOL_VERSION,
+      reveal_mode: REVEAL_MODE,
+      reveal_interval_ms: REVEAL_ITEM_DELAY_MS,
+      active_duration_ms: activeDurationMs,
+      resume_count: resumeCountRef.current,
+      draw_detail_count: 0, // ResearchDraws(正本)の実カウントで下から非同期に確定させる
+      draw_detail_status: "local_only",
+      // coin_used = coin_initial - (符号付きの)coinRemainingRef.current。coin_exhausted時は
+      // 最後のdrawのオーバーシュート分だけcoin_initialを超えることがある(実消費量として正確)。
+      // coin_remainingは表示・レコードとも下限0でclampする(参加者へ負の残高を見せない)。
+      coin_initial: INITIAL_COIN,
+      coin_remaining: Math.max(0, coinRemainingRef.current),
+      coin_used: INITIAL_COIN - coinRemainingRef.current,
       // endpoint未設定ならlocal_onlyのまま固定。設定済みならpendingとして保存し、
       // この直後の送信結果でsent/failedへ更新する(ネットワークの成否に関わらずローカル保存が先)。
       submission_status: isSubmissionConfigured() ? "pending" : "local_only",
@@ -347,7 +620,19 @@ export function useResearchSession() {
     researchStore.clearActiveExperiment();
     setFinalRecord(record);
     setIsRetiring(false);
-    setUiPhase("revealed");
+    setPhase("revealed");
+
+    // draw_detail_count(ResearchDrawsの実カウント)は非同期にしか取得できないため、
+    // 確定した時点でExperiments側のレコードとUI表示の両方を更新する。
+    void researchDrawsDb
+      .countDrawsForExperiment(meta.experimentId)
+      .then((count) => {
+        researchStore.updateExperimentDrawDetailCount(record.experiment_id, count);
+        setFinalRecord((prev) => (prev && prev.experiment_id === record.experiment_id ? { ...prev, draw_detail_count: count } : prev));
+      })
+      .catch(() => {
+        // 件数確認ができなくても実験結果自体は既に保存済みのため、致命的ではない。
+      });
 
     // ローカル保存が完了した後にのみ送信を試みる。失敗してもローカルの記録は失われない。
     if (record.submission_status === "pending") {
@@ -367,13 +652,25 @@ export function useResearchSession() {
 
     if (pendingGiveUpRef.current) {
       pendingSurveyAnswersRef.current = answers;
-      setUiPhase("awaiting_exit_reason");
+      setPhase("awaiting_exit_reason");
+      return;
+    }
+
+    if (pendingCoinExhaustedRef.current) {
+      // coin <= 0 かつTarget未達のケース。参加者の任意終了(giveUp)とは別経路だが、
+      // Core内部の状態確定にはCoreのgiveUp()をそのまま再利用する(censored=true・
+      // RUNNING→REVEALEDへの遷移はcoinの有無に関わらず同じ内部処理でよいため)。
+      // 退出理由(exit_reason)は参加者の主観的な理由専用のためnullのまま尋ねない。
+      if (session.phase !== ResearchModePhases.RUNNING) return;
+      session.giveUp();
+      finalize(session, { surveyAnswers: answers, exitReason: null, terminationReason: "coin_exhausted" });
+      pendingCoinExhaustedRef.current = false;
       return;
     }
 
     if (session.phase !== ResearchModePhases.AWAITING_SURVEY) return;
     session.submitSurvey(answers);
-    finalize(session, { surveyAnswers: answers, exitReason: null });
+    finalize(session, { surveyAnswers: answers, exitReason: null, terminationReason: "target_match" });
   }, []);
 
   // 途中終了時のみ、事後アンケートの後に尋ねる退出理由。回答後に初めてCoreのgiveUp()を呼び確定させる。
@@ -381,7 +678,7 @@ export function useResearchSession() {
     const session = sessionRef.current;
     if (!session || !pendingGiveUpRef.current) return;
     session.giveUp(); // ここで初めてCore内部のphase/finishedAtを確定させる(この間rollCountは増えていない)
-    finalize(session, { surveyAnswers: pendingSurveyAnswersRef.current, exitReason });
+    finalize(session, { surveyAnswers: pendingSurveyAnswersRef.current, exitReason, terminationReason: "participant_giveup" });
     pendingGiveUpRef.current = false;
     pendingSurveyAnswersRef.current = null;
   }, []);
@@ -394,7 +691,7 @@ export function useResearchSession() {
     stopRequestedRef.current = true; // revealBatchが実行中なら即座に停止させる
     pendingGiveUpRef.current = true;
     setIsRetiring(true);
-    setUiPhase("awaiting_survey");
+    setPhase("awaiting_survey");
   }, [uiPhase]);
 
   // 結果画面からの手動再送。pending/failedのままlocalStorageに残っている今回のレコードを再送する。
@@ -411,11 +708,16 @@ export function useResearchSession() {
     sessionRef.current = null;
     metaRef.current = null;
     pendingGiveUpRef.current = false;
+    pendingCoinExhaustedRef.current = false;
     pendingSurveyAnswersRef.current = null;
     pauseStartedAtRef.current = null;
     stopRequestedRef.current = false;
     isRevealingRef.current = false;
-    setUiPhase("idle");
+    activeMsBaseRef.current = 0;
+    activeAccumulatedRef.current = 0;
+    activePeriodStartRef.current = null;
+    coinRemainingRef.current = INITIAL_COIN;
+    setPhase("idle");
     setRollCount(0);
     setCurrentBatchRevealed([]);
     setIsRevealing(false);
@@ -427,8 +729,10 @@ export function useResearchSession() {
     setDrawAdvanceMode(null);
     setAutoRemainingMs(0);
     setIsAutoPaused(false);
+    setCoinRemaining(INITIAL_COIN);
     pauseCountRef.current = 0;
     pausedDurationMsRef.current = 0;
+    resumeCountRef.current = 0;
   }, []);
 
   return {
@@ -454,6 +758,11 @@ export function useResearchSession() {
     submitSurvey,
     submitExitReason,
     reset,
+
+    // コイン(常時表示用。指示1節)
+    coinRemaining,
+    coinUsed: INITIAL_COIN - coinRemaining,
+    coinInitial: INITIAL_COIN,
 
     // manual/auto
     drawAdvanceMode,

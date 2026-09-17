@@ -1,9 +1,10 @@
 # 血晶抽選エンジン仕様書 (Blood Gem Draw Engine Spec)
 
-- ステータス: **設計中（実装なし）**
+- ステータス: **実装済み（app/core、35テストで検証済み）。研究モード・シミュレーターモードの両方から利用されている。**
 - 対象: 物欲センサー検証アプリ / 血晶石マラソン・シミュレーター
 - 本ドキュメントは確率・抽選ロジックのみを扱う。UI・実験フロー・10連の表示演出は別文書 `docs/experiment_ui_flow_spec.md` を参照。
 - 未確定の数値は `TBD` として明示する。
+- 本書のFidelity Contract・確率モデル（0〜7節）は実装済みのDrawEngine/ProbabilityEngineと一致しており、UI都合で変更されたことはない（変更禁止の方針は今後も維持する）。v0.13以降の更新は主に10章（実験ログ）・バージョン管理・TBD一覧の実装状況の反映であり、確率モデル自体には手を入れていない。
 
 ## 更新履歴
 
@@ -16,6 +17,8 @@
 - v0.10: 5.2.3節で提起した命名の整合性問題を解消。`bloodtinge_scaling`（v0.4記録）と`warm_blt_scaling`（v0.9採用）は同一効果（Bloodtinge scaling UP／血質補正UP）であることが確認された。3デブ側でも使用している`warm_blt_scaling`を正式effectIdとして維持し、`bloodtinge_scaling`は表示上のaliasとして扱う（データ構造への変更はなし）。あわせて`blood`（Blood ATK UP／血の攻撃力UP）は`warm_blt_scaling`とは別効果であることを確認・明記。
 - v0.11: 赤オーラ貞子のPrimary7項目・Secondary9項目について、`manastone_effect`上の連続ValueSeriesとRating規則（Depth5/赤オーラ）・強化Secondary構造・実ドロップ検算の複合根拠により、R16/R17/R18を一括で`confirmed`へ昇格（5.2.4節、いわゆる「第一確定グループ」）。evidenceはrankごとに`game_param_datamined`/`farm_validated`を使い分けて配列登録。PrimaryとSecondaryのValue Rankが独立抽選である点を明記。残りのPrimary16項目・Secondary10項目は現状維持（第二段階で個別確認予定）。7.1節に適用例を追加。
 - v0.12: 3体目の敵、女幽霊（`evil_labyrinth_spirit`）のEnemyDefinition/GemDataset骨格を追加（5.3節）。secondarySlot="fixed"（`poorman_physical`固定、種類抽選なし）、Rating候補R15/R16/R17（各1/3）、`allowDuplicateSecondary: true`（primaryとfixed secondaryの同一effectId重複を許可）。ValueTable系列の逆転（random primaryはSec.1系列、fixed secondaryはPrim.1系列）を、女幽霊専用の分岐を作らず既存のEffectValueBinding（3.2節）で表現。R17実ドロップ3例（physical/striking_charge/poorman_physicalの各primary×fixed secondary=poorman_physical 27%）をconfirmed登録し、Primary/fixedSecondaryのValue Rank独立抽選の実測根拠とした。R15/R16は候補値（25%/26%）を含め引き続きunknown。
+- v0.13: DrawEngine/ProbabilityEngine自体は完全にfreezeしたまま、実装状況を現実に合わせて更新。`computeGemProbability(dataset, gem)`を追加（4節のProbabilityEngineに、実際に抽選で出た1個のBloodGemそのものの生成確率を計算する派生ヘルパーとして実装。新しい確率モデルではなく、既存の`computeProbability`を単一値のTargetBloodGemで呼ぶだけ）。コイン消費コスト式（tier / raw surprisal / capped surprisal / dataset-normalized surprisal）の比較検討に使うためのもので、コスト式自体・初期コイン量はまだ未確定（研究プロトコル側の検討事項。本書のスコープ外）。10章（実験ログ）・TBD一覧・次のステップを実装済みの内容に更新。
+- v0.14: 同じく確率モデル自体は不変のまま、`enumerateGemProbabilities(dataset)`（dataset全体の全canonical組み合わせとその正確なpの列挙。p=0の組み合わせは除外）と`computeDatasetEntropyBits(dataset)`（dataset全体のShannon entropy、bits/draw）を追加。コインコスト式D（dataset-normalized surprisal、`cost = base × I(g)/H(dataset)`）の分母・比較検討の基盤として使う。既存のenumerate相当ロジック（テストの独自ヘルパー）とcross-validationし、sum(p)=1・一様分布での解析解一致を確認済み。研究プロトコル側でコスト式Dを第一候補として確定した（`docs/experiment_ui_flow_spec.md` 3.8節）。
 
 ---
 
@@ -744,19 +747,34 @@ SourceMeta {
 
 ## 10. 実験ログ（Google Spreadsheet送信項目）
 
+**実装状況（v0.13時点）**: 以下は`app/web/src/storage/researchHistory.ts`の`ResearchExperiment`型として実装済み。送信直前に`app/web/src/services/submissionDto.ts`がTarget関連フィールドをフラット化してから`Experiments`シートへ送る（ネストしたJSONのままでは列名と一致しないため）。詳細な画面フロー・survey項目・resume・ResearchDraws・コインについては`docs/experiment_ui_flow_spec.md`を正とする（本節は概要のみ）。
+
 | フィールド | 内容 |
 |---|---|
 | participant_id / experiment_id | 匿名ID・実験ごとのID |
-| started_at / finished_at / duration_ms | 時刻・所要時間 |
-| batch_count | 10連を押した回数 |
-| dataset_id | 使用したGemDatasetのID |
-| enemy / target_shape / target_primary / target_primary_rank / target_secondary / target_secondary_rank / accepted_curses | ターゲット条件一式 |
+| started_at / finished_at / duration_ms | 時刻・所要時間（duration_msは壁時計。画面を離れていた時間も含む） |
+| active_duration_ms | 参加者が実際に画面上で活動していた累積時間（タブ非表示中・auto一時停止中を除く） |
+| resume_count | reload後に再開した回数 |
+| batch_count | 「次の10連」を押した回数（resumeを跨いでも絶対値として継続） |
+| dataset_id / enemy_id / enemy_display_name | 使用したGemDataset・敵の識別情報 |
+| shape / primary_effect_id / primary_label / primary_allowed_ranks / primary_allowed_values / secondary_effect_id / secondary_label / secondary_allowed_ranks / secondary_allowed_values / accepted_curse_ids / accepted_curse_labels | ターゲット条件一式（送信DTOでフラット化。label/allowed_valuesはTargetがLOCKされる実験開始時点のdataset/data_versionから導出したsnapshotで、以後(送信時を含め)再計算しない） |
 | desire_score | 実験前の欲しさ評価（1〜5） |
-| roll_count | 実際の試行回数（血晶1個=1試行。研究モードではTarget Match位置まで。experiment_ui_flow_spec.md 3.1節参照） |
-| theoretical_probability / expected_rolls | 事後開示する理論値 |
-| sensor_score | 物欲センサーを感じた程度（1〜5） |
-| success / censored | 条件達成の有無 / 途中で諦めたか |
-| engine_version / data_version | バージョン |
+| roll_count | 実際の試行回数（血晶1個=1試行。研究モードではTarget Match位置までの絶対通し番号。experiment_ui_flow_spec.md 3.1節参照） |
+| cutoff_draws | 途中終了(censored)時の打ち切りまでの絶対通し番号 |
+| theoretical_probability / expected_draws | 事後開示する理論値（p, 約1/p） |
+| tedious_score / real_game_burden_score / sensor_score / effort_reward_fit_score / perceived_expected_draws | 事後アンケートQ1〜Q5（順序固定。experiment_ui_flow_spec.md 3.5節参照） |
+| success / censored | 条件達成の有無 / 途中で打ち切られたか |
+| exit_reason | 途中終了時の参加者本人の主観的な理由 |
+| termination_reason | 実験の終わり方の客観的な理由（`target_match` / `participant_giveup` / `coin_exhausted`。coin_exhaustedはv0.5(experiment_ui_flow_spec.md)でproduction配線済み） |
+| engine_version / data_version | DrawEngine/GemDatasetのバージョン |
+| app_version / research_protocol_version / draw_detail_schema_version / reveal_mode / reveal_interval_ms | バージョン管理一式（experiment_ui_flow_spec.md 6節参照）。coin配線後は`research_protocol_version = "v3-coin"` |
+| draw_detail_count / draw_detail_status | ResearchDraws（10.1節）との整合確認用 |
+| coin_initial / coin_remaining / coin_used | コイン(有限resource/cost体験)の実験サマリ。個々のdrawの内訳はResearchDraws参照（experiment_ui_flow_spec.md 3.8節） |
+| submission_status | Apps Scriptへの送信状態 |
+
+### 10.1 ResearchDraws（1 visible draw = 1 record）
+
+研究モードでは、参加者の画面へ実際に提示されたdraw（Target Match後などで内部生成されたが見せなかったdrawは含まない）を、`Experiments`とは別に`ResearchDraws`として1件ずつ記録する。canonicalなBloodGemのraw field（`shape_id` / `primary_effect_id` / `primary_value_rank` / `secondary_effect_id` / `secondary_value_rank` / `curse_id`）をそのまま保持し、near miss等の解釈は行わない（後から自由に再計算できるようにするため）。確率監査用の`gem_probability_exact`/`gem_surprisal_bits`と、コイン消費の`coin_cost`/`coin_remaining_after_draw`/`coin_cost_model_version`も実値で記録する（v0.5でcoinをproduction配線したため。それ以前のレコードでは`null`）。現在はブラウザのIndexedDB（`app/web/src/storage/researchDrawsDb.ts`）にのみ保存しており、Apps Scriptへの送信経路はクライアント側のDTO設計まで完了、Apps Script側の受け口は未確定（現物確認後に対応。次セッションの作業）。詳細schemaはexperiment_ui_flow_spec.md 6.2節を参照。
 
 ---
 
@@ -767,14 +785,11 @@ SourceMeta {
 - 女幽霊: Primary残り20項目（`pthumeru_standard_primary_pool`のうちSec.1系列が未登録のもの）のValueSeries、Fixed Secondary（`poorman_physical`）のR15/R16直接対応
 - `researchEligible`のしきい値
 - `gemDropRate`レイヤーの設計（将来）
+- コインコスト式は`coin_cost = max(1, round(100 × I(g)/H(dataset)))`・`initial_coin=100,000`・`researchEligible <= 1,000`draws、すべて確定してproductionへ配線済み（DrawEngine/ProbabilityEngine自体は無変更。詳細は`docs/experiment_ui_flow_spec.md` 3.8節）
+- Apps Script側（Experiments列のflatten対応・ResearchDraws受信endpoint）は現物確認後に対応
 
 ---
 
 ## 次のステップ
 
-1. （ユーザー側）貞子の残りPrimary16項目・Secondary10項目のR16/R17 ValueSeriesを順次提供。
-2. （ユーザー側）女幽霊のPrimary残り20項目のSec.1系列ValueSeries、Fixed SecondaryのR15/R16を順次提供。
-3. データモデル確定後、M3E CanvasでUI設計
-4. Claude Codeでの実装に着手
-
-**本仕様書の段階ではコード実装には入らない。**
+DrawEngine/ProbabilityEngineとしての実装・テストは完了している。残る作業は研究プロトコル側（`docs/experiment_ui_flow_spec.md`参照）のApps Script対応・Analysis拡張であり、本書の確率モデル自体に変更の予定はない。

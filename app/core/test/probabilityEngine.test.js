@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { draw, getEligibleCurses } from "../src/engine/drawEngine.js";
-import { computeProbability } from "../src/engine/probabilityEngine.js";
+import { draw, drawOne, getEligibleCurses } from "../src/engine/drawEngine.js";
+import { computeProbability, computeGemProbability, enumerateGemProbabilities, computeDatasetEntropyBits } from "../src/engine/probabilityEngine.js";
 import { isMatch } from "../src/engine/targetMatcher.js";
 import { createSeededRng } from "../src/engine/rng.js";
 import { totalWeight, effectiveWeight } from "../src/engine/weightedPick.js";
@@ -212,6 +212,142 @@ test("ProbabilityEngine × Monte Carlo(実データ): 貞子はBLOCKER#1・#2と
   const matchCount = gems.filter((g) => isMatch(g, target)).length;
 
   assertMatchesMonteCarlo(matchCount, N, p, "madman REAL DATA target");
+});
+
+// dataset全体を虱潰しに列挙する(コインコスト検討用のcomputeGemProbabilityの正しさを
+// 独立に検証するためのテスト専用ヘルパー。DrawEngine/ProbabilityEngine本体には持ち込まない)。
+function enumerateGems(dataset) {
+  const shapeIds = dataset.shapeTable.entries.map((e) => e.shapeId);
+  const primaryEntries = [...dataset.effectPools.primary.nativeEntries, ...dataset.effectPools.primary.ooeEntries];
+  const curseIds = dataset.cursePool.entries.map((e) => e.curseId);
+  const gems = [];
+  for (const shapeId of shapeIds) {
+    for (const primaryEntry of primaryEntries) {
+      for (const primaryValueRank of dataset.primaryRankTiers) {
+        const secondaryCombos = [];
+        if (dataset.enemy.secondarySlot === "selectable") {
+          const secondaryEntries = [...dataset.effectPools.secondary.nativeEntries, ...dataset.effectPools.secondary.ooeEntries];
+          for (const secondaryEntry of secondaryEntries) {
+            for (const secondaryValueRank of dataset.secondaryRankTiers) {
+              secondaryCombos.push({ secondaryEffectId: secondaryEntry.effectId, secondaryValueRank });
+            }
+          }
+        } else if (dataset.enemy.secondarySlot === "fixed") {
+          for (const secondaryValueRank of dataset.secondaryRankTiers) {
+            secondaryCombos.push({ secondaryEffectId: dataset.enemy.fixedSecondaryEffectId, secondaryValueRank });
+          }
+        } else {
+          secondaryCombos.push({ secondaryEffectId: null, secondaryValueRank: null });
+        }
+        for (const secondary of secondaryCombos) {
+          for (const curseId of curseIds) {
+            gems.push({
+              datasetId: dataset.datasetId,
+              shapeId,
+              primaryEffectId: primaryEntry.effectId,
+              primaryValueRank,
+              secondaryEffectId: secondary.secondaryEffectId,
+              secondaryValueRank: secondary.secondaryValueRank,
+              curseId,
+            });
+          }
+        }
+      }
+    }
+  }
+  return gems;
+}
+
+test("computeGemProbability: 3デブ(secondaryなし)の全組み合わせを列挙するとp合計が1になる", () => {
+  const dataset = buildTestDataset("watchers");
+  const gems = enumerateGems(dataset);
+  const total = gems.reduce((sum, gem) => sum + computeGemProbability(dataset, gem).p, 0);
+  assert.ok(Math.abs(total - 1) < 1e-9, `sum of p over full enumeration = ${total}, expected 1`);
+});
+
+test("computeGemProbability: 貞子(selectable secondary)の全組み合わせを列挙するとp合計が1になる", () => {
+  const dataset = buildTestDataset("madman");
+  const gems = enumerateGems(dataset);
+  const total = gems.reduce((sum, gem) => sum + computeGemProbability(dataset, gem).p, 0);
+  assert.ok(Math.abs(total - 1) < 1e-9, `sum of p over full enumeration = ${total}, expected 1`);
+});
+
+test("computeGemProbability: 女幽霊(fixed secondary)の全組み合わせを列挙するとp合計が1になる", () => {
+  const dataset = buildTestDataset("evilSpirit");
+  const gems = enumerateGems(dataset);
+  const total = gems.reduce((sum, gem) => sum + computeGemProbability(dataset, gem).p, 0);
+  assert.ok(Math.abs(total - 1) < 1e-9, `sum of p over full enumeration = ${total}, expected 1`);
+});
+
+test("computeGemProbability: 実際にdrawOneで生成した1個のgemに対し0より大きいpを返す(排他済みの組み合わせを引かない限り)", () => {
+  const dataset = buildTestDataset("madman");
+  const rng = createSeededRng(777);
+  for (let i = 0; i < 200; i++) {
+    const gem = drawOne(dataset, { rng });
+    const { p } = computeGemProbability(dataset, gem);
+    assert.ok(p > 0 && p <= 1, `drawOneで実際に生成されたgemのpは0より大きいはず: p=${p}`);
+  }
+});
+
+test("enumerateGemProbabilities: このテストファイル独自のenumerateGems()と独立に一致する(貞子)", () => {
+  const dataset = buildTestDataset("madman");
+  const manual = enumerateGems(dataset)
+    .map((gem) => ({ gem, p: computeGemProbability(dataset, gem).p }))
+    .filter((x) => x.p > 0);
+  const fromCore = enumerateGemProbabilities(dataset);
+
+  assert.equal(fromCore.length, manual.length);
+  const manualByKey = new Map(manual.map((x) => [JSON.stringify(x.gem), x.p]));
+  for (const { gem, p } of fromCore) {
+    const expected = manualByKey.get(JSON.stringify(gem));
+    assert.ok(expected !== undefined, `enumerateGemProbabilitiesが返したgemが手動列挙に存在しない: ${JSON.stringify(gem)}`);
+    assert.ok(Math.abs(expected - p) < 1e-12);
+  }
+});
+
+test("enumerateGemProbabilities: p=0の組み合わせ(貞子のprimary==secondary重複)は除外されている", () => {
+  const dataset = buildTestDataset("madman");
+  const violating = enumerateGemProbabilities(dataset).filter(({ gem }) => gem.primaryEffectId === gem.secondaryEffectId);
+  assert.equal(violating.length, 0);
+});
+
+test("computeDatasetEntropyBits: 3体ともsum(p)=1な列挙から計算され、0以上・log2(組み合わせ数)以下に収まる", () => {
+  for (const key of ["watchers", "madman", "evilSpirit"]) {
+    const dataset = buildTestDataset(key);
+    const combos = enumerateGemProbabilities(dataset);
+    const h = computeDatasetEntropyBits(dataset);
+    assert.ok(h >= 0, `${key}: entropyは非負のはず (got ${h})`);
+    assert.ok(h <= Math.log2(combos.length) + 1e-9, `${key}: entropyは一様分布時の上限log2(${combos.length})を超えてはいけない (got ${h})`);
+  }
+});
+
+test("computeDatasetEntropyBits: 一様分布(全combo等確率)ならH=log2(組み合わせ数)に一致する(3デブ相当の合成fixture)", () => {
+  // 3デブfixtureは形状(放射:三角:欠損=100:1:1)が非一様なため、代わりに全factorが一様な
+  // 最小構成のdatasetをここだけで組み立てて、解析解log2(N)と厳密に一致することを検証する。
+  const uniformDataset = {
+    datasetId: "uniform_test",
+    enemy: { enemyId: "uniform_enemy", displayName: "uniform", secondarySlot: "none", allowDuplicateSecondary: false },
+    shapeTable: { shapeTableId: "s", entries: [{ shapeId: "a", weight: 1 }] },
+    effectPools: {
+      primary: {
+        effectPoolId: "p",
+        nativeEntries: [
+          { effectId: "x", weight: 1 },
+          { effectId: "y", weight: 1 },
+        ],
+        ooeEntries: [],
+      },
+    },
+    cursePool: { cursePoolId: "c", entries: [{ curseId: "c1", weight: 1 }] },
+    conflictGroups: { conflictGroupSetId: "cg", groups: [] },
+    primaryRankTiers: [1, 2],
+    secondaryRankTiers: null,
+    rankTierDistribution: { primary: [1, 1], secondary: null },
+  };
+  const combos = enumerateGemProbabilities(uniformDataset);
+  assert.equal(combos.length, 4); // 1 shape × 2 primary effect × 2 rank × 1 curse
+  const h = computeDatasetEntropyBits(uniformDataset);
+  assert.ok(Math.abs(h - Math.log2(4)) < 1e-9, `一様4通りのentropyはlog2(4)=2 bitsのはず (got ${h})`);
 });
 
 test("貞子(実データ): primaryValueRankとsecondaryValueRankは同一乱数・同一Rankに連動しない(独立抽選)", () => {

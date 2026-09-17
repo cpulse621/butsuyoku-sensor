@@ -15,6 +15,8 @@ interface Props {
   isRevealing: boolean;
   currentBatchRevealed: RevealedEntry[];
   resumedProgressReset: boolean;
+  coinRemaining: number;
+  coinUsed: number;
   onRevealBatch: () => void;
   onPauseAuto: () => void;
   onResumeAuto: () => void;
@@ -26,6 +28,10 @@ function formatElapsed(ms: number): string {
   const m = Math.floor(totalSeconds / 60);
   const s = totalSeconds % 60;
   return `${m}:${s.toString().padStart(2, "0")}`;
+}
+
+function formatCoin(n: number): string {
+  return n.toLocaleString("ja-JP");
 }
 
 // 研究開始後の実験専用レイアウト。manual/authoの両条件で
@@ -43,6 +49,8 @@ export function ResearchRunningLayout({
   isRevealing,
   currentBatchRevealed,
   resumedProgressReset,
+  coinRemaining,
+  coinUsed,
   onRevealBatch,
   onPauseAuto,
   onResumeAuto,
@@ -65,11 +73,13 @@ export function ResearchRunningLayout({
         </span>
         <span className="recording-status-bar__count">試行回数: {rollCount}</span>
         <span className="recording-status-bar__count">経過時間: {formatElapsed(elapsedMs)}</span>
+        <span className="recording-status-bar__count">残りコイン: {formatCoin(coinRemaining)}</span>
+        <span className="recording-status-bar__count">使用コイン: {formatCoin(coinUsed)}</span>
       </div>
 
       {resumedProgressReset && (
         <div className="blocker-box research-run-shell__notice">
-          前回の実験を再開しました。ブラウザの技術的な制約により、試行回数・経過時間・一時停止回数は0から再カウントされます（Target・欲しさ評価・manual/auto条件は引き継がれています）。
+          前回の実験を再開しました。試行回数・一時停止回数・Target・欲しさ評価・manual/auto条件はすべて引き継がれています。
         </div>
       )}
 

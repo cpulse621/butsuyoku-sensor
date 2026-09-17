@@ -151,3 +151,79 @@ export function computeProbability(dataset, target) {
     breakdown,
   };
 }
+
+// 「実際に抽選で出た1個のBloodGemそのものが出る確率」を計算する。
+// 新しい確率モデルは一切追加しない: そのgemの各フィールドを単一値のTargetBloodGemへ
+// 変換し、既存のcomputeProbability()にそのまま渡すだけ（排他・再正規化ロジックの再実装をしない）。
+// コインコストのような「レア度に応じた値」の算出根拠として使う想定（コスト式自体はここでは扱わない）。
+export function computeGemProbability(dataset, gem) {
+  const target = {
+    datasetId: gem.datasetId,
+    acceptedShapes: [gem.shapeId],
+    primaryEffectId: gem.primaryEffectId,
+    acceptedPrimaryRanks: [gem.primaryValueRank],
+    acceptedCurses: [gem.curseId],
+  };
+  if (gem.secondaryEffectId !== null && gem.secondaryEffectId !== undefined) {
+    target.secondaryEffectId = gem.secondaryEffectId;
+    target.acceptedSecondaryRanks = [gem.secondaryValueRank];
+  }
+  return computeProbability(dataset, target);
+}
+
+// datasetが生成しうる全canonical組み合わせ(BloodGemの形)とその正確な確率pを列挙する。
+// 抽選ロジックの再実装ではない: 各プールのエントリ・rankTiers・secondarySlotの分岐を
+// そのまま組み合わせて全パターンを作り、それぞれをcomputeGemProbability()に渡すだけ。
+// p=0の組み合わせ(排他で成立しないもの)は除外する。用途: コインコスト式の比較検討・
+// dataset全体のエントロピー計算(computeDatasetEntropyBits)。新しい確率モデルではない。
+export function enumerateGemProbabilities(dataset) {
+  const shapeIds = dataset.shapeTable.entries.map((e) => e.shapeId);
+  const primaryEntries = allEntries(dataset.effectPools.primary);
+  const curseIds = dataset.cursePool.entries.map((e) => e.curseId);
+  const enemy = dataset.enemy;
+
+  const results = [];
+  for (const shapeId of shapeIds) {
+    for (const primaryEntry of primaryEntries) {
+      for (const primaryValueRank of dataset.primaryRankTiers) {
+        const secondaryCombos = [];
+        if (enemy.secondarySlot === "selectable") {
+          const secondaryEntries = allEntries(dataset.effectPools.secondary);
+          for (const secondaryEntry of secondaryEntries) {
+            for (const secondaryValueRank of dataset.secondaryRankTiers) {
+              secondaryCombos.push({ secondaryEffectId: secondaryEntry.effectId, secondaryValueRank });
+            }
+          }
+        } else if (enemy.secondarySlot === "fixed") {
+          for (const secondaryValueRank of dataset.secondaryRankTiers) {
+            secondaryCombos.push({ secondaryEffectId: enemy.fixedSecondaryEffectId, secondaryValueRank });
+          }
+        } else {
+          secondaryCombos.push({ secondaryEffectId: null, secondaryValueRank: null });
+        }
+        for (const secondary of secondaryCombos) {
+          for (const curseId of curseIds) {
+            const gem = {
+              datasetId: dataset.datasetId,
+              shapeId,
+              primaryEffectId: primaryEntry.effectId,
+              primaryValueRank,
+              secondaryEffectId: secondary.secondaryEffectId,
+              secondaryValueRank: secondary.secondaryValueRank,
+              curseId,
+            };
+            const { p } = computeGemProbability(dataset, gem);
+            if (p > 0) results.push({ gem, p });
+          }
+        }
+      }
+    }
+  }
+  return results;
+}
+
+// dataset全体のShannon entropy(bits/draw): H = E[-log2(p)] = sum(p * -log2(p))。
+// コインコスト式D(dataset-normalized surprisal)の分母として使う想定。
+export function computeDatasetEntropyBits(dataset) {
+  return enumerateGemProbabilities(dataset).reduce((sum, { p }) => sum - p * Math.log2(p), 0);
+}

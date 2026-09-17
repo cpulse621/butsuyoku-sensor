@@ -836,3 +836,50 @@ body {
     width: 100%;
   }
 }
+
+/* --- Target Match通知(指示L節): 派手な演出ではなく明確な状態通知として --- */
+.target-match-notice {
+  text-align: center;
+  border: 2px solid var(--md-success);
+}
+
+.target-match-notice__badge {
+  display: inline-block;
+  border-radius: 999px;
+  padding: 8px 20px;
+  font-weight: 700;
+  font-size: 1rem;
+  background: var(--md-success-container);
+  color: var(--md-success);
+  margin: 0 0 8px;
+}
+
+.target-match-notice__roll {
+  margin: 0;
+  font-size: 1.1rem;
+  font-weight: 600;
+}
+
+/* --- Q5: 体感希少性の対数スライダー(暫定案) --- */
+.perceived-rarity-input {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.perceived-rarity-input input[type="range"] {
+  width: 100%;
+}
+
+.perceived-rarity-input__row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
+.perceived-rarity-input__value {
+  margin: 0;
+  font-weight: 600;
+}

@@ -1,0 +1,41 @@
+# 引き継ぎメモ (2026-09-18時点)
+
+次セッション開始時にまず読むための短いメモ。詳細は`docs/blood_gem_draw_engine_spec.md`・`docs/experiment_ui_flow_spec.md`を参照。
+
+## 今のステータス
+
+研究モード・シミュレーターモードとも実装済みで稼働中(GitHub Pages continuous deploy)。研究プロトコルは`research_protocol_version = "v3-coin"`まで完了しており、以下がすべてproductionへ配線済み:
+
+- Q1〜Q5事後アンケート(Q4 effort/reward fit、Q5 perceived rarity。1-2-5系列16段階＋「わからない」)
+- resume(reload復旧)。roll_count/batch_count/一時停止回数/coin残高がResearchDraws(IndexedDB)を正本として復元され、0に戻らない
+- Target表示情報(label/allowed_values)は実験開始時点(TargetがLOCKされる瞬間)のsnapshotとして固定し、以後(送信時含め)再計算しない
+- ResearchDraws(IndexedDB、1 visible draw = 1 record): canonical BloodGem raw field + 確率監査用(`gem_probability_exact`/`gem_surprisal_bits`) + コイン(`coin_cost`/`coin_remaining_after_draw`/`coin_cost_model_version`)をすべて実値で記録
+- コインシステム: `coin_cost = max(1, round(100 × I(g)/H(dataset)))`、`initial_coin = 100,000`。試行回数・残りコイン・使用コインを研究中常時表示。coin<=0かつTarget未達なら`termination_reason="coin_exhausted"`として事後アンケート後に直接finalize(退出理由は挟まない。participant_giveupとは区別)。同一drawでTarget Matchと同時発生した場合はTarget Matchを優先
+- `researchEligible`: `expected_draws <= 1,000`を研究モードのTarget選択UIにのみ適用(`app/web/src/lib/researchEligibility.ts`)。DrawEngineの分布・Simulator modeには影響しない
+
+DrawEngine/ProbabilityEngine(app/core)自体はこの一連の作業を通じて一切変更していない(Fidelity Contract・確率モデルは不変)。テスト: Core 43/43、Web 92/92、TypeScript・productionビルドともに成功、ブラウザ実機確認済み。
+
+## 次にやること(このセッションでは着手していない)
+
+1. **Apps Script / Google Sheets対応**(未着手)
+   - クライアント側は準備済み: `services/submissionDto.ts`がExperiments用のフラットなpayloadを作る(target_label_snapshotをそのまま使うため、送信時にdatasetへ依存しない)。
+   - ResearchDraws(IndexedDB)をApps Scriptへ送る経路はまだ無い。1件ずつHTTP通信せず、chunk化して`experiment_id + draw_index`をキーにidempotentな一括送信にする設計方針だけ決まっている(`docs/experiment_ui_flow_spec.md` 6.2節末尾)。実装はまだ。
+   - Apps Script側の現物(受信endpointのコード)を見せてもらってから、Experiments側の列名とDTOの対応・ResearchDraws受信ロジックを詰める。
+2. **Analysis拡張**(未着手)
+   - `docs/experiment_ui_flow_spec.md`のP節(元の指示)に列挙された比較群(理論期待回数vs実際、客観的不運度vs sensor_score、coin消費vs sensor_score/effort_reward_fit_score等)。
+   - 分析の方向性を先に固定せず、まずraw dataの収集を優先する方針。
+
+## 触ってはいけないもの
+
+- `app/core`(DrawEngine/ProbabilityEngine)の確率分布・Fidelity Contract。今回追加した`computeGemProbability`/`enumerateGemProbabilities`/`computeDatasetEntropyBits`は既存ロジックの組み合わせに過ぎず、これ自体も変更対象ではない。
+- 既存の`v2-*`以前のresearch_protocol_versionレコードへの推測backfill(target_label_snapshotやcoin関連フィールドが無くても補完しない)。
+- `motsuyoku-sensor-core`のnpmパッケージ名・localStorageキー(`motsuyoku_sensor_*`)は互換性のため維持中。新規識別子には`butsuyoku`を使う方針(既存資産のrenameはしない)。
+
+## 主要ファイル
+
+- コイン計算: `app/web/src/lib/coinCost.ts`(`COIN_COST_OPTIONS`/`INITIAL_COIN`を必ずここから参照)
+- researchEligible: `app/web/src/lib/researchEligibility.ts`
+- 実験フロー全体: `app/web/src/hooks/useResearchSession.ts`
+- ResearchDraws永続化: `app/web/src/storage/researchDrawsDb.ts`
+- Experiments永続化・CSV: `app/web/src/storage/researchHistory.ts`
+- 送信DTO: `app/web/src/services/submissionDto.ts` / `app/web/src/services/researchSubmission.ts`

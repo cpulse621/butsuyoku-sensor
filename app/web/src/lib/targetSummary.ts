@@ -1,6 +1,7 @@
-import type { TargetBloodGem } from "motsuyoku-sensor-core";
+import type { GemDataset, TargetBloodGem } from "motsuyoku-sensor-core";
+import { lookupDisplayValue } from "motsuyoku-sensor-core";
 import type { StoredTarget } from "../storage/simulationHistory";
-import { effectLabel } from "../i18n/labels";
+import { effectLabel, curseLabel } from "../i18n/labels";
 
 // シミュレーターモード・研究モード共通で使う、TargetBloodGem→永続化用の平坦なデータ形状への変換。
 export function toStoredTarget(target: TargetBloodGem): StoredTarget {
@@ -42,6 +43,42 @@ export function applyStoredTargetViaSetters(stored: StoredTarget, setters: Targe
   setters.setPrimaryEffect(stored.primary_effect_id);
   if (stored.secondary_effect_id) setters.setSecondaryEffect(stored.secondary_effect_id);
   setters.setAllCurses(stored.accepted_curse_ids);
+}
+
+// 送信DTO(services/submissionDto.ts)がSheetsへ送るTarget表示情報のスナップショット型。
+// canonicalな正本はあくまでID/rank(target/StoredTarget)であり、これは表示用の派生値。
+// 実験確定時点(finalize)の1回だけ計算してResearchExperimentへ保存し、後日(dataset更新後に)
+// 再送しても、実験当時の表示内容が変わらないようにする(指示: dataset更新後の再送で
+// 表示値が変化してしまう問題への対応)。
+export interface TargetLabelSnapshot {
+  primary_label: string;
+  primary_allowed_values: string;
+  secondary_label: string;
+  secondary_allowed_values: string;
+  accepted_curse_labels: string;
+}
+
+function ranksToValueList(dataset: GemDataset, slot: "primary" | "secondary", effectId: string, ranks: number[]): string {
+  return ranks
+    .map((rank) => {
+      const info = lookupDisplayValue(dataset, slot, effectId, rank);
+      return info.value === null ? "" : String(info.value);
+    })
+    .join(";");
+}
+
+// 実験開始/確定時点のdataset(=そのCoreセッションが使っていたdataset、実験中に変わらない)から
+// 表示情報を導出する。この関数の呼び出しタイミング(finalize時)自体が「snapshot」の実体であり、
+// 後から呼び直すことは想定していない(呼び直すと別のsnapshotになってしまうため)。
+export function buildTargetLabelSnapshot(dataset: GemDataset, target: TargetBloodGem): TargetLabelSnapshot {
+  const secondaryEffectId = target.secondaryEffectId ?? null;
+  return {
+    primary_label: effectLabel(target.primaryEffectId),
+    primary_allowed_values: ranksToValueList(dataset, "primary", target.primaryEffectId, target.acceptedPrimaryRanks),
+    secondary_label: secondaryEffectId ? effectLabel(secondaryEffectId) : "",
+    secondary_allowed_values: secondaryEffectId ? ranksToValueList(dataset, "secondary", secondaryEffectId, target.acceptedSecondaryRanks ?? []) : "",
+    accepted_curse_labels: target.acceptedCurses.map(curseLabel).join(";"),
+  };
 }
 
 export function summarizeTarget(target: TargetBloodGem): string {

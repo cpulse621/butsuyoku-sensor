@@ -2,6 +2,7 @@ import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { BloodGem, ProbabilityResult, ResearchModeRevealResult, ResearchModeSummary, TargetBloodGem } from "motsuyoku-sensor-core";
 import { listExperiments, saveActiveExperiment } from "../storage/researchHistory";
+import { appendDraw, listDrawsForExperiment, DRAW_DETAIL_SCHEMA_VERSION } from "../storage/researchDrawsDb";
 
 // useResearchSessionは「Experiment Flow」自体(roll_countの積算・MATCH停止・survey gating)を
 // Core(researchModeState.js、既にCore側の35テストで検証済み)にそのまま委ねている。
@@ -10,6 +11,10 @@ import { listExperiments, saveActiveExperiment } from "../storage/researchHistor
 // そのためcreateResearchModeSessionのみを差し替え可能にする。
 const mocks = vi.hoisted(() => ({
   sessionFactory: null as null | (() => unknown),
+  // 本番のINITIAL_COIN(100,000)のままだとTEST_DATASET(1draw=100coin)でexhaustionまで
+  // 1000回のrevealNextが必要になり、実タイマー(REVEAL_ITEM_DELAY_MS=400ms)ベースのテストでは
+  // 非現実的に遅くなる。coin関連テストだけこの値を小さく差し替える。
+  initialCoin: 100000,
 }));
 
 vi.mock("motsuyoku-sensor-core", async (importOriginal) => {
@@ -20,12 +25,27 @@ vi.mock("motsuyoku-sensor-core", async (importOriginal) => {
   };
 });
 
+vi.mock("../lib/coinCost", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../lib/coinCost")>();
+  return {
+    ...actual,
+    get INITIAL_COIN() {
+      return mocks.initialCoin;
+    },
+  };
+});
+
 // eslint-disable-next-line import/first
 import { useResearchSession, REVEAL_ITEM_DELAY_MS, AUTO_INTERVAL_MIN_MS, AUTO_INTERVAL_MAX_MS, RESUME_NOTICE_AUTO_DISMISS_MS } from "./useResearchSession";
+// eslint-disable-next-line import/first
+import { COIN_COST_MODEL_VERSION } from "../lib/coinCost";
 
-function makeGem(): BloodGem {
+// datasetIdはデフォルトでTEST_DATASET(下記)に合わせた値だが、resumeテストのように
+// 実在するdataset(WatchersDataset等)を使う場合は明示的に合わせる必要がある
+// (computeGemProbabilityがtarget.datasetIdとdataset.datasetIdの一致を要求するため)。
+function makeGem(datasetId = "test_dataset"): BloodGem {
   return {
-    datasetId: "test_dataset",
+    datasetId,
     shapeId: "radial",
     primaryEffectId: "physical",
     primaryValueRank: 18,
@@ -37,7 +57,7 @@ function makeGem(): BloodGem {
 
 // Core(researchModeState.js)と同じ契約を持つ、テスト用の決定的なフェイクセッション。
 // matchAtRollCountに達した時点でmatched:trueを返しphaseをawaiting_surveyへ進める。
-function createFakeCoreSession(matchAtRollCount: number | null) {
+function createFakeCoreSession(matchAtRollCount: number | null, datasetId = "test_dataset") {
   let phase: ResearchModeSummary["phase"] = "setup";
   let rollCount = 0;
   let matchedAt: number | null = null;
@@ -59,7 +79,7 @@ function createFakeCoreSession(matchAtRollCount: number | null) {
         matchedAt = rollCount;
         phase = "awaiting_survey";
       }
-      return { gem: makeGem(), rollCount, matched };
+      return { gem: makeGem(datasetId), rollCount, matched };
     },
     giveUp() {
       censored = true;
@@ -109,10 +129,33 @@ function createFakeCoreSession(matchAtRollCount: number | null) {
   };
 }
 
+// revealBatch()はcreateResearchModeSession()(モック済み)経由の抽選とは別に、
+// computeGemProbability()(motsuyoku-sensor-coreの実物、モックしていない)を実際に呼ぶため、
+// このfixtureはcomputeProbability内部が参照するpool構造を(最小限だが)本物同様に持つ必要がある。
+// makeGem()が返す固定gem(radial/physical/R18/stamina_cost_up)がちょうど「唯一の組み合わせ」に
+// なるようにして、p=1で一意に確定させている。
 const TEST_DATASET = {
   datasetId: "test_dataset",
   enemy: { enemyId: "merciless_watchers", displayName: "3デブ", secondarySlot: "none", allowDuplicateSecondary: false },
   dataVersion: "vTest",
+  shapeTable: { shapeTableId: "s", entries: [{ shapeId: "radial", weight: 1 }] },
+  effectPools: { primary: { effectPoolId: "p", nativeEntries: [{ effectId: "physical", weight: 1 }], ooeEntries: [] } },
+  // 2件以上の呪いを用意する(1通りしかないとentropy=0になり、coinコスト計算(H(dataset)で割る)が
+  // ゼロ除算エラーになるため)。makeGem()が返す固定gem(curseId: stamina_cost_up)は
+  // 引き続きp=0.5(2択のうち1つ)として有効な組み合わせのまま。
+  cursePool: {
+    cursePoolId: "c",
+    entries: [
+      { curseId: "stamina_cost_up", weight: 1 },
+      { curseId: "hp_deplete", weight: 1 },
+    ],
+  },
+  conflictGroups: { conflictGroupSetId: "cg", groups: [] },
+  primaryRankTiers: [18],
+  secondaryRankTiers: null,
+  rankTierDistribution: { primary: [1], secondary: null },
+  effectValueBindings: [],
+  valueSeriesById: {},
 } as any;
 
 const TEST_TARGET: TargetBloodGem = {
@@ -127,6 +170,7 @@ describe("hooks/useResearchSession", () => {
   beforeEach(() => {
     localStorage.clear();
     mocks.sessionFactory = null;
+    mocks.initialCoin = 100000;
   });
 
   it("startExperimentでrunning状態になり、実験中は理論確率が一切見えない(finalProbability=null)", () => {
@@ -174,7 +218,7 @@ describe("hooks/useResearchSession", () => {
     });
 
     act(() => {
-      result.current.submitSurvey({ tediousnessScore: 3, painIfRepeatedScore: 2, sensorScore: 5 });
+      result.current.submitSurvey({ tediousnessScore: 3, painIfRepeatedScore: 2, sensorScore: 5, effortRewardFitScore: 3, perceivedExpectedDraws: 100 });
     });
 
     expect(result.current.uiPhase).toBe("revealed");
@@ -183,6 +227,9 @@ describe("hooks/useResearchSession", () => {
     expect(result.current.finalRecord?.roll_count).toBe(2);
     expect(result.current.finalRecord?.tedious_score).toBe(3);
     expect(result.current.finalRecord?.sensor_score).toBe(5);
+    expect(result.current.finalRecord?.effort_reward_fit_score).toBe(3);
+    expect(result.current.finalRecord?.perceived_expected_draws).toBe(100);
+    expect(result.current.finalRecord?.termination_reason).toBe("target_match");
     expect(result.current.finalRecord?.submission_status).toBe("local_only");
 
     const saved = listExperiments();
@@ -212,7 +259,7 @@ describe("hooks/useResearchSession", () => {
 
     // アンケート回答 → 退出理由待ちへ
     act(() => {
-      result.current.submitSurvey({ tediousnessScore: 4, painIfRepeatedScore: 2, sensorScore: 1 });
+      result.current.submitSurvey({ tediousnessScore: 4, painIfRepeatedScore: 2, sensorScore: 1, effortRewardFitScore: 3, perceivedExpectedDraws: 100 });
     });
     expect(result.current.uiPhase).toBe("awaiting_exit_reason");
     expect(result.current.finalRecord).toBeNull(); // まだ理論確率も結果も出さない
@@ -231,6 +278,7 @@ describe("hooks/useResearchSession", () => {
     expect(result.current.finalRecord?.tedious_score).toBe(4);
     expect(result.current.finalRecord?.sensor_score).toBe(1);
     expect(result.current.finalRecord?.exit_reason).toBe("tedious");
+    expect(result.current.finalRecord?.termination_reason).toBe("participant_giveup");
 
     const saved = listExperiments();
     expect(saved).toHaveLength(1);
@@ -275,7 +323,7 @@ describe("hooks/useResearchSession", () => {
       await result.current.revealBatch();
     });
     act(() => {
-      result.current.submitSurvey({ tediousnessScore: 1, painIfRepeatedScore: 1, sensorScore: 1 });
+      result.current.submitSurvey({ tediousnessScore: 1, painIfRepeatedScore: 1, sensorScore: 1, effortRewardFitScore: 3, perceivedExpectedDraws: 100 });
     });
 
     expect(result.current.finalRecord?.draw_advance_mode).toBe("auto");
@@ -303,6 +351,9 @@ describe("hooks/useResearchSession", () => {
       desire_score: 3,
       draw_advance_mode: "manual",
       auto_interval_ms: null,
+      pause_count: 0,
+      paused_duration_ms: 0,
+      resume_count: 0,
     });
 
     const { result } = renderHook(() => useResearchSession());
@@ -494,7 +545,7 @@ describe("hooks/useResearchSession", () => {
 
         // その後アンケート・退出理由を経てcutoff_drawsが正確であることを確認
         act(() => {
-          result.current.submitSurvey({ tediousnessScore: 3, painIfRepeatedScore: 3, sensorScore: 3 });
+          result.current.submitSurvey({ tediousnessScore: 3, painIfRepeatedScore: 3, sensorScore: 3, effortRewardFitScore: 3, perceivedExpectedDraws: 100 });
         });
         act(() => {
           result.current.submitExitReason("tedious");
@@ -560,12 +611,15 @@ describe("hooks/useResearchSession", () => {
         desire_score: 3,
         draw_advance_mode: "manual",
         auto_interval_ms: null,
+        pause_count: 0,
+        paused_duration_ms: 0,
+        resume_count: 0,
       });
       mocks.sessionFactory = () => createFakeCoreSession(null);
       const { result } = renderHook(() => useResearchSession());
 
-      act(() => {
-        result.current.resumeExperiment();
+      await act(async () => {
+        await result.current.resumeExperiment();
       });
       expect(result.current.resumedProgressReset).toBe(true);
 
@@ -582,7 +636,7 @@ describe("hooks/useResearchSession", () => {
       10000
     );
 
-    it("実験を終了すると、通知フラグも消える", () => {
+    it("実験を終了すると、通知フラグも消える", async () => {
       saveActiveExperiment({
         experiment_id: "resumed-exp-3",
         participant_id: "participant-1",
@@ -601,12 +655,15 @@ describe("hooks/useResearchSession", () => {
         desire_score: 3,
         draw_advance_mode: "manual",
         auto_interval_ms: null,
+        pause_count: 0,
+        paused_duration_ms: 0,
+        resume_count: 0,
       });
       mocks.sessionFactory = () => createFakeCoreSession(null);
       const { result } = renderHook(() => useResearchSession());
 
-      act(() => {
-        result.current.resumeExperiment();
+      await act(async () => {
+        await result.current.resumeExperiment();
       });
       expect(result.current.resumedProgressReset).toBe(true);
 
@@ -614,13 +671,418 @@ describe("hooks/useResearchSession", () => {
         result.current.giveUp();
       });
       act(() => {
-        result.current.submitSurvey({ tediousnessScore: 1, painIfRepeatedScore: 1, sensorScore: 1 });
+        result.current.submitSurvey({ tediousnessScore: 1, painIfRepeatedScore: 1, sensorScore: 1, effortRewardFitScore: 3, perceivedExpectedDraws: 100 });
       });
       act(() => {
         result.current.submitExitReason("other");
       });
 
       expect(result.current.resumedProgressReset).toBe(false);
+    });
+  });
+
+  describe("ResearchDraws(IndexedDB)への1 visible draw = 1 recordの永続化", () => {
+    it("表示されたdrawだけがResearchDrawsへ保存され、Target Match後の未表示分は保存されない", async () => {
+      const fake = createFakeCoreSession(3); // 3件目でMATCH
+      mocks.sessionFactory = () => fake;
+      const { result } = renderHook(() => useResearchSession());
+
+      act(() => {
+        result.current.startExperiment(TEST_DATASET, TEST_TARGET, 5);
+      });
+      await act(async () => {
+        await result.current.revealBatch();
+      });
+
+      act(() => {
+        result.current.submitSurvey({ tediousnessScore: 1, painIfRepeatedScore: 1, sensorScore: 1, effortRewardFitScore: 3, perceivedExpectedDraws: 100 });
+      });
+      const experimentId = result.current.finalRecord!.experiment_id;
+
+      const rows = await listDrawsForExperiment(experimentId);
+      expect(rows).toHaveLength(3); // #1〜#3のみ(MATCHした#3自身は含むが、#4以降は生成されていない)
+      expect(rows.map((r) => r.draw_index)).toEqual([1, 2, 3]);
+      expect(rows[2].target_match).toBe(true);
+      expect(rows[0].target_match).toBe(false);
+      expect(rows[0].draw_detail_schema_version).toBe(DRAW_DETAIL_SCHEMA_VERSION);
+    });
+
+    it("finalize後、draw_detail_countがResearchDrawsの実カウントと一致するよう非同期に更新される", async () => {
+      const fake = createFakeCoreSession(2);
+      mocks.sessionFactory = () => fake;
+      const { result } = renderHook(() => useResearchSession());
+
+      act(() => {
+        result.current.startExperiment(TEST_DATASET, TEST_TARGET, 5);
+      });
+      await act(async () => {
+        await result.current.revealBatch();
+      });
+      act(() => {
+        result.current.submitSurvey({ tediousnessScore: 1, painIfRepeatedScore: 1, sensorScore: 1, effortRewardFitScore: 3, perceivedExpectedDraws: 100 });
+      });
+
+      // draw_detail_countの更新はIndexedDB読み出し後の非同期処理なので、マイクロタスクを進める。
+      await act(async () => {
+        await Promise.resolve();
+        await Promise.resolve();
+      });
+
+      expect(result.current.finalRecord?.draw_detail_count).toBe(2);
+      const [saved] = listExperiments();
+      expect(saved.draw_detail_count).toBe(2);
+    });
+  });
+
+  describe("resume(案A): roll_offsetをResearchDraws(正本)から復元する", () => {
+    it("reload前に3件保存済みなら、resume後の最初のMATCHでroll_countが3+相対値になる(0に戻らない)", async () => {
+      const experimentId = "resume-offset-exp";
+      // reload前に既に3件のvisible drawが記録されていた状況を再現する。
+      await appendDraw({
+        experiment_id: experimentId,
+        draw_index: 1,
+        batch_index: 1,
+        active_elapsed_ms: 400,
+        wall_elapsed_ms: 400,
+        dataset_id: "pthumeru_depth5_standard_watchers_v0_1",
+        shape_id: "radial",
+        primary_effect_id: "physical",
+        primary_value_rank: 18,
+        secondary_effect_id: null,
+        secondary_value_rank: null,
+        curse_id: "stamina_cost_up",
+        target_match: false,
+        gem_probability_exact: 0.05,
+        gem_surprisal_bits: 4.32,
+        coin_cost: null,
+        coin_remaining_after_draw: null,
+        coin_cost_model_version: null,
+        draw_detail_schema_version: DRAW_DETAIL_SCHEMA_VERSION,
+      });
+      await appendDraw({
+        experiment_id: experimentId,
+        draw_index: 2,
+        batch_index: 1,
+        active_elapsed_ms: 800,
+        wall_elapsed_ms: 800,
+        dataset_id: "pthumeru_depth5_standard_watchers_v0_1",
+        shape_id: "radial",
+        primary_effect_id: "physical",
+        primary_value_rank: 18,
+        secondary_effect_id: null,
+        secondary_value_rank: null,
+        curse_id: "stamina_cost_up",
+        target_match: false,
+        gem_probability_exact: 0.05,
+        gem_surprisal_bits: 4.32,
+        coin_cost: null,
+        coin_remaining_after_draw: null,
+        coin_cost_model_version: null,
+        draw_detail_schema_version: DRAW_DETAIL_SCHEMA_VERSION,
+      });
+      await appendDraw({
+        experiment_id: experimentId,
+        draw_index: 3,
+        batch_index: 1,
+        active_elapsed_ms: 1200,
+        wall_elapsed_ms: 1200,
+        dataset_id: "pthumeru_depth5_standard_watchers_v0_1",
+        shape_id: "radial",
+        primary_effect_id: "physical",
+        primary_value_rank: 18,
+        secondary_effect_id: null,
+        secondary_value_rank: null,
+        curse_id: "stamina_cost_up",
+        target_match: false,
+        gem_probability_exact: 0.05,
+        gem_surprisal_bits: 4.32,
+        coin_cost: null,
+        coin_remaining_after_draw: null,
+        coin_cost_model_version: null,
+        draw_detail_schema_version: DRAW_DETAIL_SCHEMA_VERSION,
+      });
+
+      saveActiveExperiment({
+        experiment_id: experimentId,
+        participant_id: "participant-1",
+        started_at: "2026-01-01T00:00:00.000Z",
+        dataset_id: "pthumeru_depth5_standard_watchers_v0_1",
+        enemy_id: "merciless_watchers",
+        enemy_display_name: "3デブ",
+        target: {
+          shape: ["radial"],
+          primary_effect_id: "physical",
+          primary_allowed_ranks: [18],
+          secondary_effect_id: null,
+          secondary_allowed_ranks: null,
+          accepted_curse_ids: ["stamina_cost_up"],
+        },
+        desire_score: 3,
+        draw_advance_mode: "manual",
+        auto_interval_ms: null,
+        pause_count: 0,
+        paused_duration_ms: 0,
+        resume_count: 0,
+      });
+
+      // 新しいCoreセッション内の相対2件目でMATCH。実在するWatchersDatasetを使うため、
+      // fake gemのdatasetIdもそれに合わせる(computeGemProbabilityがdatasetId一致を要求するため)。
+      const fake = createFakeCoreSession(2, "pthumeru_depth5_standard_watchers_v0_1");
+      mocks.sessionFactory = () => fake;
+      const { result } = renderHook(() => useResearchSession());
+
+      await act(async () => {
+        await result.current.resumeExperiment();
+      });
+      expect(result.current.rollCount).toBe(3); // resume直後、表示上のroll_countも3から始まる
+
+      await act(async () => {
+        await result.current.revealBatch();
+      });
+      // 絶対roll_count = 前回までの3件 + 今回セッションの相対2件目 = 5
+      expect(result.current.rollCount).toBe(5);
+      expect(result.current.uiPhase).toBe("awaiting_survey");
+
+      act(() => {
+        result.current.submitSurvey({ tediousnessScore: 1, painIfRepeatedScore: 1, sensorScore: 1, effortRewardFitScore: 3, perceivedExpectedDraws: 100 });
+      });
+      expect(result.current.finalRecord?.roll_count).toBe(5);
+      expect(result.current.finalRecord?.resume_count).toBe(1);
+
+      const rows = await listDrawsForExperiment(experimentId);
+      expect(rows.map((r) => r.draw_index)).toEqual([1, 2, 3, 4, 5]); // resume前の3件+今回の2件がすべて揃う
+    });
+  });
+
+  describe("target_label_snapshot: TargetがLOCKされる実験開始時点で固定する", () => {
+    it("実験開始後にdataset側の値が更新されても、finalize時点のsnapshotは開始時点の値のまま変化しない", async () => {
+      const mutableDataset = {
+        ...TEST_DATASET,
+        effectValueBindings: [{ slot: "primary", effectId: "physical", valueSeriesId: "vs1", unit: "percent" }],
+        valueSeriesById: { vs1: { valueSeriesId: "vs1", valuesByRank: { 18: { value: 20, verificationStatus: "confirmed" } } } },
+      };
+      const fake = createFakeCoreSession(1);
+      mocks.sessionFactory = () => fake;
+      const { result } = renderHook(() => useResearchSession());
+
+      act(() => {
+        result.current.startExperiment(mutableDataset, TEST_TARGET, 5);
+      });
+
+      // 実験開始「後」にdataset側のValueSeriesが更新された状況を模擬する(deploy更新等)。
+      mutableDataset.valueSeriesById.vs1.valuesByRank[18].value = 999;
+
+      await act(async () => {
+        await result.current.revealBatch();
+      });
+      act(() => {
+        result.current.submitSurvey({ tediousnessScore: 1, painIfRepeatedScore: 1, sensorScore: 1, effortRewardFitScore: 3, perceivedExpectedDraws: 100 });
+      });
+
+      // finalize()がここで再計算していれば999が入ってしまうはずだが、実験開始時点の20のまま。
+      expect(result.current.finalRecord?.target_label_snapshot.primary_allowed_values).toBe("20");
+    });
+
+    it("resume後もsnapshotは(現在のdatasetから再計算せず)実験開始時点にlocalStorageへ保存された値をそのまま引き継ぐ", async () => {
+      const staleLookingSnapshot = {
+        primary_label: "開始時点のラベル",
+        primary_allowed_values: "12.3",
+        secondary_label: "",
+        secondary_allowed_values: "",
+        accepted_curse_labels: "開始時点の呪いラベル",
+      };
+      saveActiveExperiment({
+        experiment_id: "resume-snapshot-exp",
+        participant_id: "participant-1",
+        started_at: "2026-01-01T00:00:00.000Z",
+        dataset_id: "pthumeru_depth5_standard_watchers_v0_1",
+        enemy_id: "merciless_watchers",
+        enemy_display_name: "3デブ",
+        target: {
+          shape: ["radial"],
+          primary_effect_id: "physical",
+          primary_allowed_ranks: [18],
+          secondary_effect_id: null,
+          secondary_allowed_ranks: null,
+          accepted_curse_ids: ["stamina_cost_up"],
+        },
+        target_label_snapshot: staleLookingSnapshot,
+        desire_score: 3,
+        draw_advance_mode: "manual",
+        auto_interval_ms: null,
+        pause_count: 0,
+        paused_duration_ms: 0,
+        resume_count: 0,
+      });
+
+      const fake = createFakeCoreSession(1, "pthumeru_depth5_standard_watchers_v0_1");
+      mocks.sessionFactory = () => fake;
+      const { result } = renderHook(() => useResearchSession());
+
+      await act(async () => {
+        await result.current.resumeExperiment();
+      });
+      await act(async () => {
+        await result.current.revealBatch();
+      });
+      act(() => {
+        result.current.submitSurvey({ tediousnessScore: 1, painIfRepeatedScore: 1, sensorScore: 1, effortRewardFitScore: 3, perceivedExpectedDraws: 100 });
+      });
+
+      // 実際のWatchersDatasetから再計算していれば別の値になるはずだが、保存済みsnapshotのまま。
+      expect(result.current.finalRecord?.target_label_snapshot).toEqual(staleLookingSnapshot);
+    });
+  });
+
+  describe("coin(有限resource/cost体験)のproduction配線", () => {
+    it("visible drawごとにcoinが消費され、ResearchDrawsへcoin_cost/coin_remaining_after_draw/coin_cost_model_versionが記録される", async () => {
+      const fake = createFakeCoreSession(3); // 3件目でMATCH
+      mocks.sessionFactory = () => fake;
+      const { result } = renderHook(() => useResearchSession());
+
+      act(() => {
+        result.current.startExperiment(TEST_DATASET, TEST_TARGET, 5);
+      });
+      expect(result.current.coinRemaining).toBe(100000);
+      expect(result.current.coinInitial).toBe(100000);
+
+      await act(async () => {
+        await result.current.revealBatch();
+      });
+      // TEST_DATASET+makeGem()固定の組み合わせはp=0.5(呪い2択のうち1つ)・H=1bitのため、
+      // 1drawあたりcost=round(100*1/1)=100になる。3件表示されたので300消費されているはず。
+      expect(result.current.coinRemaining).toBe(100000 - 300);
+      expect(result.current.coinUsed).toBe(300);
+
+      act(() => {
+        result.current.submitSurvey({ tediousnessScore: 1, painIfRepeatedScore: 1, sensorScore: 1, effortRewardFitScore: 3, perceivedExpectedDraws: 100 });
+      });
+      expect(result.current.finalRecord?.coin_initial).toBe(100000);
+      expect(result.current.finalRecord?.coin_remaining).toBe(100000 - 300);
+      expect(result.current.finalRecord?.coin_used).toBe(300);
+
+      const rows = await listDrawsForExperiment(result.current.finalRecord!.experiment_id);
+      expect(rows).toHaveLength(3);
+      expect(rows.map((r) => r.coin_cost)).toEqual([100, 100, 100]);
+      expect(rows.map((r) => r.coin_remaining_after_draw)).toEqual([100000 - 100, 100000 - 200, 100000 - 300]);
+      for (const row of rows) {
+        expect(row.coin_cost_model_version).toBe(COIN_COST_MODEL_VERSION);
+        expect(row.gem_probability_exact).toBeGreaterThan(0);
+        expect(row.gem_surprisal_bits).toBeGreaterThan(0);
+      }
+    });
+
+    it("coin<=0かつTarget未達なら、事後アンケート後に直接finalizeされ(退出理由は挟まない)termination_reason=coin_exhaustedとなり、participant_giveupとは区別される", async () => {
+      mocks.initialCoin = 150; // 1draw=100coinなので、2件目で残高-50、exhausted
+      const fake = createFakeCoreSession(null); // マッチしない
+      mocks.sessionFactory = () => fake;
+      const { result } = renderHook(() => useResearchSession());
+
+      act(() => {
+        result.current.startExperiment(TEST_DATASET, TEST_TARGET, 5);
+      });
+
+      await act(async () => {
+        await result.current.revealBatch();
+      });
+      expect(result.current.uiPhase).toBe("awaiting_survey");
+      expect(result.current.isRetiring).toBe(false); // 参加者が終了ボタンを押したわけではない
+      expect(fake.revealNextCallCount).toBe(2); // 2件目でexhausted、以降のdrawは生成されない
+      expect(result.current.coinRemaining).toBe(0); // 負の分は表示上clampされる
+
+      act(() => {
+        result.current.submitSurvey({ tediousnessScore: 2, painIfRepeatedScore: 2, sensorScore: 2, effortRewardFitScore: 2, perceivedExpectedDraws: null });
+      });
+      // 退出理由ステップ(awaiting_exit_reason)を経由せず、直接revealedへ確定する。
+      expect(result.current.uiPhase).toBe("revealed");
+      expect(result.current.finalRecord?.success).toBe(false);
+      expect(result.current.finalRecord?.censored).toBe(true);
+      expect(result.current.finalRecord?.exit_reason).toBeNull();
+      expect(result.current.finalRecord?.termination_reason).toBe("coin_exhausted");
+      expect(result.current.finalRecord?.coin_remaining).toBe(0);
+      expect(result.current.finalRecord?.coin_used).toBe(200); // 2draws×100
+
+      // Target Matchより後・coin exhaustionより後の未提示drawは保存も課金もされない。
+      const rows = await listDrawsForExperiment(result.current.finalRecord!.experiment_id);
+      expect(rows).toHaveLength(2);
+    });
+
+    it("同一drawでTarget Matchとcoin exhaustionが同時発生した場合はTarget Matchを優先する", async () => {
+      mocks.initialCoin = 50; // 1件目のcost(100)で即座に残高が0を下回るほど小さい
+      const fake = createFakeCoreSession(1); // 1件目でMATCH
+      mocks.sessionFactory = () => fake;
+      const { result } = renderHook(() => useResearchSession());
+
+      act(() => {
+        result.current.startExperiment(TEST_DATASET, TEST_TARGET, 5);
+      });
+      await act(async () => {
+        await result.current.revealBatch();
+      });
+      expect(result.current.uiPhase).toBe("awaiting_survey");
+
+      act(() => {
+        result.current.submitSurvey({ tediousnessScore: 1, painIfRepeatedScore: 1, sensorScore: 1, effortRewardFitScore: 3, perceivedExpectedDraws: 100 });
+      });
+      expect(result.current.finalRecord?.success).toBe(true);
+      expect(result.current.finalRecord?.censored).toBe(false);
+      expect(result.current.finalRecord?.termination_reason).toBe("target_match");
+    });
+
+    it("resume後もcoinRemainingはResearchDraws最終行のcoin_remaining_after_drawから復元される(0や初期値に戻らない)", async () => {
+      const experimentId = "resume-coin-exp";
+      await appendDraw({
+        experiment_id: experimentId,
+        draw_index: 1,
+        batch_index: 1,
+        active_elapsed_ms: 400,
+        wall_elapsed_ms: 400,
+        dataset_id: "pthumeru_depth5_standard_watchers_v0_1",
+        shape_id: "radial",
+        primary_effect_id: "physical",
+        primary_value_rank: 18,
+        secondary_effect_id: null,
+        secondary_value_rank: null,
+        curse_id: "stamina_cost_up",
+        target_match: false,
+        gem_probability_exact: 0.05,
+        gem_surprisal_bits: 4.32,
+        coin_cost: 432,
+        coin_remaining_after_draw: 99568,
+        coin_cost_model_version: COIN_COST_MODEL_VERSION,
+        draw_detail_schema_version: DRAW_DETAIL_SCHEMA_VERSION,
+      });
+      saveActiveExperiment({
+        experiment_id: experimentId,
+        participant_id: "participant-1",
+        started_at: "2026-01-01T00:00:00.000Z",
+        dataset_id: "pthumeru_depth5_standard_watchers_v0_1",
+        enemy_id: "merciless_watchers",
+        enemy_display_name: "3デブ",
+        target: {
+          shape: ["radial"],
+          primary_effect_id: "physical",
+          primary_allowed_ranks: [18],
+          secondary_effect_id: null,
+          secondary_allowed_ranks: null,
+          accepted_curse_ids: ["stamina_cost_up"],
+        },
+        desire_score: 3,
+        draw_advance_mode: "manual",
+        auto_interval_ms: null,
+        pause_count: 0,
+        paused_duration_ms: 0,
+        resume_count: 0,
+      });
+
+      const fake = createFakeCoreSession(null, "pthumeru_depth5_standard_watchers_v0_1");
+      mocks.sessionFactory = () => fake;
+      const { result } = renderHook(() => useResearchSession());
+
+      await act(async () => {
+        await result.current.resumeExperiment();
+      });
+      expect(result.current.coinRemaining).toBe(99568); // 100,000から0からではなく前回の続きから
     });
   });
 });

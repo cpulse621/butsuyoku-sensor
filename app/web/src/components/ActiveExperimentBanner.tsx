@@ -17,7 +17,7 @@ export function ActiveExperimentBanner({ snapshot, onResume, onDiscard }: Props)
         {snapshot.target.secondary_effect_id ? ` / 2op: ${effectLabel(snapshot.target.secondary_effect_id)}` : ""} / 欲しさ {snapshot.desire_score}/5
       </p>
       <p className="hint">
-        ブラウザの技術的な制約により、再開すると試行回数・経過時間・一時停止回数は0から再カウントされます（Target・欲しさ評価・manual/auto条件は引き継がれます）。
+        試行回数・一時停止回数・Target・欲しさ評価・manual/auto条件はすべて引き継がれます。ブラウザの技術的な制約により、経過時間の表示のみ、再開後の最新表示に切り替わるまで少し時間がかかることがあります。
       </p>
       <div className="pull-controls">
         <button type="button" className="primary-button" onClick={onResume}>

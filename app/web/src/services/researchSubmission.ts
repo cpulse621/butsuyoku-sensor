@@ -14,6 +14,7 @@
 
 import * as researchStore from "../storage/researchHistory";
 import type { ResearchExperiment, SubmissionStatus } from "../storage/researchHistory";
+import { buildExperimentSubmissionPayload } from "./submissionDto";
 
 export type SubmissionOutcome = { status: "local_only" } | { status: "sent" } | { status: "failed"; error: string };
 
@@ -36,10 +37,11 @@ export async function submitExperiment(experiment: ResearchExperiment): Promise<
   }
 
   try {
+    const payload = buildExperimentSubmissionPayload(experiment);
     const res = await fetch(endpoint, {
       method: "POST",
       headers: { "Content-Type": "text/plain;charset=UTF-8" },
-      body: JSON.stringify(experiment),
+      body: JSON.stringify(payload),
     });
     if (!res.ok) {
       return { status: "failed", error: `HTTP ${res.status}` };
