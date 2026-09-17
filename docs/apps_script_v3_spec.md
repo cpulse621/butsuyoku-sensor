@@ -1,8 +1,13 @@
 # Apps Script v3 データ送信仕様
 
-次セッションでApps Script(`Code.gs`)とクライアント側ResearchDraws送信を実装する際の設計contract。
-`docs/handoff.md`から参照される詳細仕様。ここに書かれた内容は実装前の合意事項であり、
-まだコードには反映していない(次セッションで着手する)。
+Apps Script(`Code.gs`)とクライアント側ResearchDraws送信の設計contract。`docs/handoff.md`から参照される詳細仕様。
+
+## 実装状況(2026-09-18時点)
+
+- **クライアント側(`app/web`)は本仕様に対応済み**: `services/researchSubmission.ts`(Experiments、`request_type: "experiment"`のenvelope)、`services/researchDrawsSubmission.ts`(ResearchDraws、250件/chunkでの`request_type: "research_draws_chunk"`送信)、`services/appsScriptEndpoint.ts`(共通POST処理)。
+- **Apps Script側は未デプロイ**: `apps_script/Code.gs`に本仕様のリファレンス実装を書き起こしたが、実際のプロジェクトの現行`Code.gs`を直接見て差分マージしたものではない。デプロイ前に必ず`apps_script/README.md`のレビュー手順に従うこと。
+- 実際のGoogle Apps Scriptエンドポイントに対しては本ラウンドでは一切送信していない(未レビューのスクリプトに対して本番の研究データを送るリスクを避けるため)。ブラウザ確認は`VITE_RESEARCH_ENDPOINT`未設定の状態(`local_only`扱い)でのみ行った。
+- `success_cdf_at_roll` / `survival_probability_at_cutoff`のR1C1相対参照修正は、実際の数式を見ていないため`apps_script/Code.gs`に含まれていない。
 
 ---
 
@@ -27,8 +32,8 @@
   - `draw_detail_schema_version`
   - `reveal_mode`
   - `reveal_interval_ms`
-  - `draw_detail_count`
-  - `draw_detail_status`
+  - `draw_detail_count`(意味は8節参照。**ローカルで記録されたvisible ResearchDrawsの期待件数**であり、Apps Scriptへのupload済み件数ではない)
+- `draw_detail_status`は永続列として持たない(8節参照)。
 - 既存データへの推測backfillは禁止(v2以前の行にこれらの新列を後付けで埋めない)。
 
 ### ResearchDraws — 1 visible draw = 1 row
@@ -120,6 +125,7 @@ ResearchDraws受信時は最低限、処理件数を返す:
 ## 5. 書き込み
 
 - ResearchDrawsは**1drawごとにappendしない**。chunk内を配列化し、`setValues()`で一括書き込みする。
+- 書き込みは全rowのvalidationが通った場合のみ実行する(8節4項)。1件でも不正なrowがあればchunk全体を書き込まず失敗として返す。
 - Experimentsの既存`experiment_id`dedupeは維持する(壊さない)。
 
 ---
@@ -141,6 +147,20 @@ ResearchDraws受信時は最低限、処理件数を返す:
 - 既存Experimentsデータ(28件前後)は変更しない。
 - 新規**ResearchDraws tab**を作成する。
 - Spreadsheet timezoneは、v3本収集前に`America/Los_Angeles` → `Asia/Tokyo`へ変更する。**過去のISO timestamp自体は書き換えない**(timezone設定の変更のみ。表示上の解釈が変わる点に注意)。
+
+---
+
+## 8. ResearchDrawsの完全性判定(実装前に固定)
+
+1. **`draw_detail_count`はExperiments側に保存する。** これは**ローカルで記録されたvisible ResearchDrawsの期待件数**(そのexperiment_idでIndexedDBに保存されている行数)であり、Apps Scriptへのupload済み件数ではない。クライアントは自分がローカルに何件記録したかを報告するだけで、送信の成否は別途chunkの成否で判断する。
+2. **`draw_detail_status`は永続フィールドとして持たない。** complete / incompleteは、Analysis時にResearchDraws側の`experiment_id`別行数と、Experiments側の`draw_detail_count`を突き合わせて導出する（`ResearchDrawsの実際の行数 === Experiments.draw_detail_count` ならcomplete）。これにより、ResearchDraws送信が後から進んだ際にExperiments側の1行を更新しにいくAPI(後更新API)が不要になる。Apps Script側もクライアント側も、この列への書き込み・読み出しロジックを実装しない。
+3. **chunk成功条件は `received === inserted + duplicates`。** Apps Scriptはこの等式が成り立つ場合のみそのchunkを成功として扱う。成り立たない場合(=一部rowが検証エラー等でinsertされず、duplicateにもならなかった)はchunk失敗として扱い、4節のvalidation方針に従って書き込みを行わない。
+4. **ResearchDraws chunkは書き込み前に全rowをvalidationする。**
+   - malformedなrow(必須フィールド欠落・型不一致等)を黙ってskipしてはいけない。
+   - validationに1件でも失敗した場合、**原則としてchunk全体を失敗させ、`setValues`を一切実行しない**(部分書き込みをしない)。
+   - この全か無かの方針により、クライアントは同じchunkをそのまま安全に再送できる(部分的に書き込まれた行と再送分が重複する、といった状態を防ぐ)。
+   - 失敗時のレスポンスにも`ok: false`と、可能であればどのrow(何番目のdraw_index)がvalidationに失敗したかを含め、クライアント側でのデバッグ・修復を助ける。
+5. **dedupeは引き続き`experiment_id + draw_index`の複合キーを正本とする。**（3節の内容を再確認。`chunk_id`はログ・トレース用の識別子であり、dedupeの判定には使わない。）
 
 ---
 

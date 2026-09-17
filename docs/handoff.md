@@ -13,47 +13,56 @@
 - コインシステム: `coin_cost = max(1, round(100 × I(g)/H(dataset)))`、`initial_coin = 100,000`。試行回数・残りコイン・使用コインを研究中常時表示。coin<=0かつTarget未達なら`termination_reason="coin_exhausted"`として事後アンケート後に直接finalize(退出理由は挟まない。participant_giveupとは区別)。同一drawでTarget Matchと同時発生した場合はTarget Matchを優先
 - `researchEligible`: `expected_draws <= 1,000`を研究モードのTarget選択UIにのみ適用(`app/web/src/lib/researchEligibility.ts`)。DrawEngineの分布・Simulator modeには影響しない
 
-DrawEngine/ProbabilityEngine(app/core)自体はこの一連の作業を通じて一切変更していない(Fidelity Contract・確率モデルは不変)。テスト: Core 43/43、Web 92/92、TypeScript・productionビルドともに成功、ブラウザ実機確認済み。
+DrawEngine/ProbabilityEngine(app/core)自体はこの一連の作業を通じて一切変更していない(Fidelity Contract・確率モデルは不変)。テスト: Core 43/43、Web 98/98、TypeScript・productionビルドともに成功、ブラウザ実機確認済み(3draw・Target Match・survey・finalize・IndexedDB上のcoin_cost等の実値まで確認)。
+
+クライアント側のResearchDraws送信処理も本ラウンドで実装済み: `services/researchDrawsSubmission.ts`が250件/chunkで`request_type: "research_draws_chunk"`のenvelopeを送信し、`finalize()`・`resendFinalRecord()`・`ResearchHistoryPanel`の再送・`App.tsx`起動時のpending/failed再送ヒューリスティックに配線済み。`services/researchSubmission.ts`もExperimentsを`request_type: "experiment"`のenvelopeで送るよう変更済み(旧`request_type`無しPOSTとの後方互換はApps Script側で担保する前提)。
 
 ## 次にやること(このセッションでは着手していない)
 
 ### 1. Apps Script / Google Sheets対応(未着手。次セッションの最優先事項)
 
-**設計contractが確定済み**: リクエスト形式・chunk仕様・dedupeキー・レスポンス形式・Sheet運用まで、`docs/apps_script_v3_spec.md`に合意事項として書き出してある。実装前に必ずこのファイルを読むこと(要点は以下にも再掲するが、詳細・JSON例はそちらが正)。
+**設計contractが確定済み**: リクエスト形式・chunk仕様・dedupeキー・レスポンス形式・Sheet運用・ResearchDrawsの完全性判定(draw_detail_count/draw_detail_statusの扱い含む)まで、`docs/apps_script_v3_spec.md`に合意事項として書き出してある(8節まで完結)。実装前に必ずこのファイルを読むこと(要点は以下にも再掲するが、詳細・JSON例はそちらが正)。
 
 **現物確認済みの事実(2026-09-18時点)**:
 
 1. Apps Script(`Code.gs`)は現在**Experiments専用**の`doPost`のみで、ResearchDraws用のルーティングは存在しない。
 2. `doPost`はheaderごとに`payload[header]`を読み、`experiment_id`でdedupeして1行書き込む構造。
 3. 旧Target列(shape/primary_effect_id等)が空だった原因は**確定した**: 以前のクライアントは`target`がネストしたobjectのままpayloadに含まれており、`payload.shape`等のフラットなキーが存在しなかったため。**現在の`services/submissionDto.ts`は送信前にflatten済み**なので、このDTOをそのままExperiments行の正として送信してよい(Apps Script側のExperiments処理自体は変更不要、または最小限)。
-4. `success_cdf_at_roll` / `survival_probability_at_cutoff`(Sheets側の既存の派生列)は現在**R1C1の相対参照**で計算されており、v3で列を追加すると参照がずれて壊れる。**header名ベースの参照に書き換える必要がある**。
+4. `success_cdf_at_roll` / `survival_probability_at_cutoff`(Sheets側の既存の派生列)は現在**R1C1の相対参照**で計算されており、v3で列を追加すると参照がずれて壊れる。**header名ベースの参照に書き換える必要がある**。実際の数式テキストが未共有のため、`apps_script/Code.gs`のリファレンス実装にはこの修正は含まれていない。
 5. 既存Sheetsデータは28件前後。**変更・削除・推測backfillは一切しない**(v2以前のレコードにv3の列を後付けで埋めない)。
 6. 既存Experimentsの`experiment_id`によるdedupeロジックは**維持する**(壊さない)。
 7. Google Sheetsのtimezoneが現在`America/Los_Angeles`になっている。**v3の本収集を始める前に`Asia/Tokyo`へ変更する**(タイムスタンプ列の解釈がずれるため、変更後の既存行への影響有無も確認すること)。
 8. Apps Script変更後は**新しいdeploymentが必要**(コード変更だけではWebアプリURLへ反映されない)。
 
+**このラウンドで追加した成果物と、その既知のギャップ**:
+
+- `apps_script/Code.gs`(新規): `docs/apps_script_v3_spec.md`の合意事項を書き起こした**リファレンス実装**。**実際のプロジェクトの現行`Code.gs`を直接見て差分を取ったものではない**ため、そのままデプロイせず、既存コードとのマージ・レビューが必須(`apps_script/README.md`に手順あり)。実装内容: `request_type`によるrouting(無指定は`experiment`として後方互換扱い)、Experiments用のheader名ベース読み書き(`ensureHeadersExist`で新規v3列を右側に自動追加)、ResearchDraws用の全rowバリデーション→**1件でも不正なら`setValues`を一切呼ばずchunk全体を失敗させる**書き込み、`experiment_id+draw_index`複合キーでの重複除外、`{ok, received, inserted, duplicates}`レスポンス。
+- `success_cdf_at_roll` / `survival_probability_at_cutoff`のR1C1修正は**未実装**(上記4参照)。
+- クライアント側には「ResearchDrawsをApps Scriptへ送信済みかどうか」を示す永続フィールドが無い(意図的な設計。`docs/apps_script_v3_spec.md`8節参照)。そのため`App.tsx`起動時の再送は、Experiments側の`submission_status`が`pending`/`failed`のexperiment_idに対してResearchDrawsも一緒に再送を試みる、という**ヒューリスティック**に留まる。ResearchDrawsだけが未送信でExperimentsは送信済み、というケースの自動リカバリはこの仕組みではカバーされない(手動での`ResearchHistoryPanel`からの再送、または将来の専用ステータス列追加で対応)。
+- 実際のGoogle Apps Scriptエンドポイントに対する送信テストは**本ラウンドでは一切行っていない**(未レビューのスクリプトに本番研究データを送るリスクを避けるため)。ブラウザ確認は`VITE_RESEARCH_ENDPOINT`未設定(`local_only`)の状態でのみ実施し、IndexedDB上の`ResearchDraws`レコード(`coin_cost`/`coin_remaining_after_draw`/`gem_probability_exact`/`gem_surprisal_bits`等)が実値で正しく記録されることを確認した。
+
 **ResearchDraws受信の設計要件の要点(詳細は`docs/apps_script_v3_spec.md`)**:
 
 - POSTに`request_type`を持たせる(`"experiment"` / `"research_draws_chunk"`。`request_type`が無い旧POSTは`experiment`として後方互換的に扱う)。
 - ResearchDrawsは通常250件・上限500件/requestのchunkで送る(`chunk_id`例: `<experiment_id>:1-250`)。dedupeの正本はchunk_idではなく**`experiment_id + draw_index`の複合キー**。
-- 受信したchunkは1行ずつ`appendRow`せず、**まとめて`setValues`で書き込む**。
+- 受信したchunkは1行ずつ`appendRow`せず、**まとめて`setValues`で書き込む**。書き込み前に全rowをvalidationし、1件でも不正ならchunk全体を失敗させ`setValues`自体を呼ばない(部分書き込みをしない。再送安全性のため)。
+- chunk成功条件は`received === inserted + duplicates`。
 - レスポンスは最低限`{ ok, received, inserted, duplicates }`を返し、クライアントが送信件数と処理件数の不一致を検知できるようにする。
 - Experimentsの既存`experiment_id`単体dedupeは維持する(ResearchDrawsの複合キーdedupeとは別ロジック)。
-- クライアント側(`app/web`)のResearchDraws送信処理自体もまだ実装していない(IndexedDBへの永続化とcheckpointは完了済みだが、Apps Scriptへ送るコードはまだ無い)。`researchSubmission.ts`と同様のパターン(endpoint未設定ならlocal_onlyのまま、送信失敗してもローカルデータは失われない)を踏襲する想定。
+- `draw_detail_status`は永続列として持たない。complete/incompleteはAnalysis時に`ResearchDraws`の`experiment_id`別行数と`Experiments.draw_detail_count`を突き合わせて導出する。
 - 新規`ResearchDraws` tabを作成する(既存Experiments tabは変更しない)。
-- 将来`research_events_chunk`等を追加できるよう`request_type`方式にしておくが、今回(次セッション)はResearchEventsを実装しない。
+- 将来`research_events_chunk`等を追加できるよう`request_type`方式にしておくが、今回はResearchEventsを実装しない。
 
-**次セッションで最初にやること(この順で設計・実装)**:
+**次セッションで最初にやること(この順で進める)**:
 
-1. v3 Experiments schema(既存43列は削除・並べ替えせず、`docs/apps_script_v3_spec.md`記載の新規列候補を右側に追加。現行`Code.gs`のExperiments処理とクライアントの`submissionDto.ts`のフィールド対応を確認し、必要な差分だけ直す)
-2. ResearchDraws schema(新規tab。列定義は`docs/apps_script_v3_spec.md`参照)
-3. Apps Scriptのrequest routing(`request_type`でdoPost内を振り分け、無指定は`experiment`扱いにする後方互換を維持)
-4. chunk化・idempotency(`experiment_id+draw_index`でのdedupe、`setValues`での一括書き込み、レスポンスでの処理件数返却)
-5. クライアント側のResearchDraws upload実装(chunk化・送信・再送・失敗時のfail-soft)
-6. `success_cdf_at_roll` / `survival_probability_at_cutoff`のR1C1相対参照をheader名ベースの参照へ書き換える(v3列追加で壊れないように)
-7. Spreadsheet timezoneを`America/Los_Angeles`→`Asia/Tokyo`へ変更(v3本収集前。過去のISO timestamp自体は書き換えない)
+1. `apps_script/Code.gs`を現行の実プロジェクトの`Code.gs`と突き合わせてレビュー・マージする(`apps_script/README.md`のチェックリストに従う)
+2. テスト用スプレッドシートで`doPost`(Experiments・ResearchDraws両方)の動作確認
+3. `success_cdf_at_roll` / `survival_probability_at_cutoff`のR1C1相対参照をheader名ベースの参照へ書き換える(実際の数式テキストを確認してから)
+4. 本番スプレッドシートへ適用し、新しいdeploymentを作成
+5. Spreadsheet timezoneを`America/Los_Angeles`→`Asia/Tokyo`へ変更(v3本収集前。過去のISO timestamp自体は書き換えない)
+6. 実際のエンドポイントに対して`VITE_RESEARCH_ENDPOINT`を設定し、実データでのend-to-end送信確認
 
-進める前に、現行`Code.gs`本体・`docs/apps_script_v3_spec.md`・本ファイルを読むこと。
+進める前に、`apps_script/Code.gs`・`apps_script/README.md`・`docs/apps_script_v3_spec.md`・本ファイルを読むこと。
 
 ### 2. Analysis拡張(未着手)
 
@@ -69,9 +78,12 @@ DrawEngine/ProbabilityEngine(app/core)自体はこの一連の作業を通じて
 ## 主要ファイル
 
 - **Apps Script v3送信仕様(次セッションで最初に読む)**: `docs/apps_script_v3_spec.md`
+- **Apps Scriptリファレンス実装(未レビュー、次セッションで最初にレビュー・マージする)**: `apps_script/Code.gs` / `apps_script/README.md`
 - コイン計算: `app/web/src/lib/coinCost.ts`(`COIN_COST_OPTIONS`/`INITIAL_COIN`を必ずここから参照)
 - researchEligible: `app/web/src/lib/researchEligibility.ts`
 - 実験フロー全体: `app/web/src/hooks/useResearchSession.ts`
 - ResearchDraws永続化: `app/web/src/storage/researchDrawsDb.ts`
 - Experiments永続化・CSV: `app/web/src/storage/researchHistory.ts`
-- 送信DTO: `app/web/src/services/submissionDto.ts` / `app/web/src/services/researchSubmission.ts`
+- 送信共通処理: `app/web/src/services/appsScriptEndpoint.ts`
+- 送信DTO・Experiments送信: `app/web/src/services/submissionDto.ts` / `app/web/src/services/researchSubmission.ts`
+- ResearchDraws送信: `app/web/src/services/researchDrawsSubmission.ts`

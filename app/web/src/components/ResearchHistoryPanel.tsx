@@ -3,6 +3,7 @@ import type { ResearchExperiment } from "../storage/researchHistory";
 import { downloadCSV, downloadJSON } from "../lib/download";
 import { effectLabel, enemyLabel, drawAdvanceModeLabel, submissionStatusLabel } from "../i18n/labels";
 import { attemptSubmission } from "../services/researchSubmission";
+import { syncResearchDrawsForExperiment } from "../services/researchDrawsSubmission";
 
 interface Props {
   open: boolean;
@@ -38,6 +39,8 @@ export function ResearchHistoryPanel({ open, onClose, listExperiments, exportJSO
   async function handleResend(experiment: ResearchExperiment) {
     setResendingId(experiment.experiment_id);
     await attemptSubmission(experiment);
+    // ExperimentsとResearchDrawsは独立した送信経路のため、再送時は両方を試みる。
+    await syncResearchDrawsForExperiment(experiment.experiment_id);
     setExperiments(listExperiments()); // 送信結果(sent/failed)を反映して再読み込み
     setResendingId(null);
   }

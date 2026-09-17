@@ -55,7 +55,6 @@ function makeExperiment(overrides: Partial<ResearchExperiment> = {}): ResearchEx
     active_duration_ms: 55000,
     resume_count: 0,
     draw_detail_count: 42,
-    draw_detail_status: "local_only",
     coin_initial: 100000,
     coin_remaining: 100000,
     coin_used: 0,
@@ -103,7 +102,12 @@ describe("services/researchSubmission", () => {
     expect(url).toBe("https://example.com/exec");
     expect(options.method).toBe("POST");
     expect(options.headers["Content-Type"]).toBe("text/plain;charset=UTF-8");
-    expect(JSON.parse(options.body)).toMatchObject({ experiment_id: "exp-1" });
+    const body = JSON.parse(options.body);
+    expect(body).toMatchObject({
+      request_type: "experiment",
+      schema_version: "experiment-v3",
+      payload: { experiment_id: "exp-1" },
+    });
   });
 
   it("送信するJSONはtargetをフラット化したトップレベルキーを持つ(ネストされたtargetオブジェクトは送らない)", async () => {
@@ -134,7 +138,9 @@ describe("services/researchSubmission", () => {
     });
     await submitExperiment(experiment);
 
-    const body = JSON.parse((fetchSpy.mock.calls[0][1] as { body: string }).body);
+    const envelope = JSON.parse((fetchSpy.mock.calls[0][1] as { body: string }).body);
+    expect(envelope.request_type).toBe("experiment");
+    const body = envelope.payload;
     expect(body.target).toBeUndefined();
     expect(body.shape).toBe("radial;triangle");
     expect(body.primary_effect_id).toBe("physical");

@@ -217,8 +217,9 @@ describe("hooks/useResearchSession", () => {
       await result.current.revealBatch();
     });
 
-    act(() => {
+    await act(async () => {
       result.current.submitSurvey({ tediousnessScore: 3, painIfRepeatedScore: 2, sensorScore: 5, effortRewardFitScore: 3, perceivedExpectedDraws: 100 });
+      await wait(50); // finalize()は非同期(ResearchDrawsの実カウントをawaitする)ため、確定を待つ
     });
 
     expect(result.current.uiPhase).toBe("revealed");
@@ -240,7 +241,7 @@ describe("hooks/useResearchSession", () => {
     expect(localStorage.getItem("motsuyoku_sensor_active_experiment_v1")).toBeNull();
   });
 
-  it("途中終了(giveUp)は必ず事後アンケート→退出理由を経由してから確定する(即結果画面へは飛ばない)", () => {
+  it("途中終了(giveUp)は必ず事後アンケート→退出理由を経由してから確定する(即結果画面へは飛ばない)", async () => {
     const fake = createFakeCoreSession(null);
     mocks.sessionFactory = () => fake;
     const { result } = renderHook(() => useResearchSession());
@@ -265,8 +266,9 @@ describe("hooks/useResearchSession", () => {
     expect(result.current.finalRecord).toBeNull(); // まだ理論確率も結果も出さない
 
     // 退出理由回答 → ここで初めて確定する
-    act(() => {
+    await act(async () => {
       result.current.submitExitReason("tedious");
+      await wait(50); // finalize()は非同期(ResearchDrawsの実カウントをawaitする)ため、確定を待つ
     });
 
     expect(result.current.uiPhase).toBe("revealed");
@@ -322,8 +324,9 @@ describe("hooks/useResearchSession", () => {
     await act(async () => {
       await result.current.revealBatch();
     });
-    act(() => {
+    await act(async () => {
       result.current.submitSurvey({ tediousnessScore: 1, painIfRepeatedScore: 1, sensorScore: 1, effortRewardFitScore: 3, perceivedExpectedDraws: 100 });
+      await wait(50);
     });
 
     expect(result.current.finalRecord?.draw_advance_mode).toBe("auto");
@@ -547,8 +550,9 @@ describe("hooks/useResearchSession", () => {
         act(() => {
           result.current.submitSurvey({ tediousnessScore: 3, painIfRepeatedScore: 3, sensorScore: 3, effortRewardFitScore: 3, perceivedExpectedDraws: 100 });
         });
-        act(() => {
+        await act(async () => {
           result.current.submitExitReason("tedious");
+          await wait(50);
         });
         expect(result.current.finalRecord?.cutoff_draws).toBe(revealedAtGiveUp);
         expect(result.current.finalRecord?.roll_count).toBeNull();
@@ -673,8 +677,9 @@ describe("hooks/useResearchSession", () => {
       act(() => {
         result.current.submitSurvey({ tediousnessScore: 1, painIfRepeatedScore: 1, sensorScore: 1, effortRewardFitScore: 3, perceivedExpectedDraws: 100 });
       });
-      act(() => {
+      await act(async () => {
         result.current.submitExitReason("other");
+        await wait(50);
       });
 
       expect(result.current.resumedProgressReset).toBe(false);
@@ -694,8 +699,9 @@ describe("hooks/useResearchSession", () => {
         await result.current.revealBatch();
       });
 
-      act(() => {
+      await act(async () => {
         result.current.submitSurvey({ tediousnessScore: 1, painIfRepeatedScore: 1, sensorScore: 1, effortRewardFitScore: 3, perceivedExpectedDraws: 100 });
+        await wait(50);
       });
       const experimentId = result.current.finalRecord!.experiment_id;
 
@@ -707,7 +713,7 @@ describe("hooks/useResearchSession", () => {
       expect(rows[0].draw_detail_schema_version).toBe(DRAW_DETAIL_SCHEMA_VERSION);
     });
 
-    it("finalize後、draw_detail_countがResearchDrawsの実カウントと一致するよう非同期に更新される", async () => {
+    it("draw_detail_count(ローカル記録の期待件数)は送信前にResearchDrawsの実カウントで確定し、後から更新されない", async () => {
       const fake = createFakeCoreSession(2);
       mocks.sessionFactory = () => fake;
       const { result } = renderHook(() => useResearchSession());
@@ -718,16 +724,12 @@ describe("hooks/useResearchSession", () => {
       await act(async () => {
         await result.current.revealBatch();
       });
-      act(() => {
-        result.current.submitSurvey({ tediousnessScore: 1, painIfRepeatedScore: 1, sensorScore: 1, effortRewardFitScore: 3, perceivedExpectedDraws: 100 });
-      });
-
-      // draw_detail_countの更新はIndexedDB読み出し後の非同期処理なので、マイクロタスクを進める。
       await act(async () => {
-        await Promise.resolve();
-        await Promise.resolve();
+        result.current.submitSurvey({ tediousnessScore: 1, painIfRepeatedScore: 1, sensorScore: 1, effortRewardFitScore: 3, perceivedExpectedDraws: 100 });
+        await wait(50); // finalize()がResearchDrawsの実カウントをawaitしてから記録を確定するのを待つ
       });
 
+      // finalize()の時点でdraw_detail_countは既に確定している(後追いのAPI更新は存在しない)。
       expect(result.current.finalRecord?.draw_detail_count).toBe(2);
       const [saved] = listExperiments();
       expect(saved.draw_detail_count).toBe(2);
@@ -843,8 +845,9 @@ describe("hooks/useResearchSession", () => {
       expect(result.current.rollCount).toBe(5);
       expect(result.current.uiPhase).toBe("awaiting_survey");
 
-      act(() => {
+      await act(async () => {
         result.current.submitSurvey({ tediousnessScore: 1, painIfRepeatedScore: 1, sensorScore: 1, effortRewardFitScore: 3, perceivedExpectedDraws: 100 });
+        await wait(50);
       });
       expect(result.current.finalRecord?.roll_count).toBe(5);
       expect(result.current.finalRecord?.resume_count).toBe(1);
@@ -875,8 +878,9 @@ describe("hooks/useResearchSession", () => {
       await act(async () => {
         await result.current.revealBatch();
       });
-      act(() => {
+      await act(async () => {
         result.current.submitSurvey({ tediousnessScore: 1, painIfRepeatedScore: 1, sensorScore: 1, effortRewardFitScore: 3, perceivedExpectedDraws: 100 });
+        await wait(50);
       });
 
       // finalize()がここで再計算していれば999が入ってしまうはずだが、実験開始時点の20のまま。
@@ -925,8 +929,9 @@ describe("hooks/useResearchSession", () => {
       await act(async () => {
         await result.current.revealBatch();
       });
-      act(() => {
+      await act(async () => {
         result.current.submitSurvey({ tediousnessScore: 1, painIfRepeatedScore: 1, sensorScore: 1, effortRewardFitScore: 3, perceivedExpectedDraws: 100 });
+        await wait(50);
       });
 
       // 実際のWatchersDatasetから再計算していれば別の値になるはずだが、保存済みsnapshotのまま。
@@ -954,8 +959,9 @@ describe("hooks/useResearchSession", () => {
       expect(result.current.coinRemaining).toBe(100000 - 300);
       expect(result.current.coinUsed).toBe(300);
 
-      act(() => {
+      await act(async () => {
         result.current.submitSurvey({ tediousnessScore: 1, painIfRepeatedScore: 1, sensorScore: 1, effortRewardFitScore: 3, perceivedExpectedDraws: 100 });
+        await wait(50);
       });
       expect(result.current.finalRecord?.coin_initial).toBe(100000);
       expect(result.current.finalRecord?.coin_remaining).toBe(100000 - 300);
@@ -990,8 +996,9 @@ describe("hooks/useResearchSession", () => {
       expect(fake.revealNextCallCount).toBe(2); // 2件目でexhausted、以降のdrawは生成されない
       expect(result.current.coinRemaining).toBe(0); // 負の分は表示上clampされる
 
-      act(() => {
+      await act(async () => {
         result.current.submitSurvey({ tediousnessScore: 2, painIfRepeatedScore: 2, sensorScore: 2, effortRewardFitScore: 2, perceivedExpectedDraws: null });
+        await wait(50);
       });
       // 退出理由ステップ(awaiting_exit_reason)を経由せず、直接revealedへ確定する。
       expect(result.current.uiPhase).toBe("revealed");
@@ -1021,8 +1028,9 @@ describe("hooks/useResearchSession", () => {
       });
       expect(result.current.uiPhase).toBe("awaiting_survey");
 
-      act(() => {
+      await act(async () => {
         result.current.submitSurvey({ tediousnessScore: 1, painIfRepeatedScore: 1, sensorScore: 1, effortRewardFitScore: 3, perceivedExpectedDraws: 100 });
+        await wait(50);
       });
       expect(result.current.finalRecord?.success).toBe(true);
       expect(result.current.finalRecord?.censored).toBe(false);

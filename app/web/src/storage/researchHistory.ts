@@ -106,10 +106,12 @@ export interface ResearchExperiment {
   // reload後にresumeした回数(0なら一度も中断されていない)。
   resume_count: number;
 
-  // ResearchDraws(1 visible draw = 1 record)との整合確認用(指示O節)。
-  // Experiments上のdraw数とResearchDrawsの実際の行数が一致しているかをここで検証できる。
+  // ResearchDraws(1 visible record)側との整合確認用。ローカルで記録された
+  // visible ResearchDrawsの「期待件数」(そのexperiment_idでIndexedDBに保存済みの行数)であり、
+  // Apps Scriptへのupload済み件数ではない。complete/incompleteはAnalysis時にResearchDraws側の
+  // 実際の行数とこの値を突き合わせて導出するため、永続的なdraw_detail_statusフィールドは
+  // 持たない(Experiments行を後から更新するAPIを不要にするため。docs/apps_script_v3_spec.md 8節)。
   draw_detail_count: number;
-  draw_detail_status: SubmissionStatus;
 
   // コイン(有限resource/cost体験。docs/experiment_ui_flow_spec.md 3.8/3.8.1節参照)の
   // 実験サマリ。個々のdrawごとの内訳はResearchDraws(coin_cost/coin_remaining_after_draw)を
@@ -206,16 +208,6 @@ export function updateExperimentSubmissionStatus(experimentId: string, status: S
   const exp = experiments.find((e) => e.experiment_id === experimentId);
   if (!exp) return { ok: false, error: `experiment "${experimentId}" が見つかりません` };
   exp.submission_status = status;
-  return writeAll(experiments);
-}
-
-// ResearchDraws(IndexedDB)の実カウントが確定した時点で、Experiments側のdraw_detail_countを
-// 更新する(指示O節: Experiments上のdraw数とResearchDrawsの実際の行数が一致しているか確認できるように)。
-export function updateExperimentDrawDetailCount(experimentId: string, count: number): StorageResult {
-  const experiments = readAll();
-  const exp = experiments.find((e) => e.experiment_id === experimentId);
-  if (!exp) return { ok: false, error: `experiment "${experimentId}" が見つかりません` };
-  exp.draw_detail_count = count;
   return writeAll(experiments);
 }
 
@@ -317,7 +309,6 @@ const CSV_HEADERS = [
   "active_duration_ms",
   "resume_count",
   "draw_detail_count",
-  "draw_detail_status",
   "coin_initial",
   "coin_remaining",
   "coin_used",
@@ -375,7 +366,6 @@ export function exportExperimentsAsCSV(): string {
       e.active_duration_ms,
       e.resume_count,
       e.draw_detail_count,
-      e.draw_detail_status,
       e.coin_initial,
       e.coin_remaining,
       e.coin_used,

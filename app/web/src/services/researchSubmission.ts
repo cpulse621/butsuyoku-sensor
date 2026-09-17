@@ -1,4 +1,4 @@
-// Google Apps Script(研究データ受信endpoint)への送信層。
+// Google Apps Script(研究データ受信endpoint)への送信層(Experiments)。
 //
 // 重要:
 // - ビルド時に環境変数 VITE_RESEARCH_ENDPOINT が設定されていない限り、
@@ -6,8 +6,9 @@
 // - endpoint URL自体はユーザーから明示提供された公開情報(秘密鍵ではない)であり、
 //   app/web/.env.production にそのまま書いてある(GitHub Pagesのproduction buildにも
 //   同じ値が埋め込まれる)。
-// - Apps Scriptへの不要なCORS preflightを避けるため、Content-Typeは
-//   "text/plain;charset=UTF-8" を使う(application/jsonは使わない)。bodyはJSON文字列のまま。
+// - POST bodyは`{ request_type: "experiment", schema_version: "experiment-v3", payload: {...} }`
+//   というenvelopeにする(docs/apps_script_v3_spec.md 2節)。ResearchDraws(研究データ受信endpoint)と
+//   同一URLを`request_type`で区別するための形式。
 // - ローカル保存(storage/researchHistory.ts)が必ず送信より先に行われる前提のオーケストレーション
 //   (attemptSubmission / retryAllPendingSubmissions)もここに集約する。
 //   送信の成否に関わらず、研究データそのものはlocalStorageに残り続ける。
@@ -15,41 +16,33 @@
 import * as researchStore from "../storage/researchHistory";
 import type { ResearchExperiment, SubmissionStatus } from "../storage/researchHistory";
 import { buildExperimentSubmissionPayload } from "./submissionDto";
+import { isEndpointConfigured, postToAppsScript } from "./appsScriptEndpoint";
 
 export type SubmissionOutcome = { status: "local_only" } | { status: "sent" } | { status: "failed"; error: string };
 
-function getConfiguredEndpoint(): string | null {
-  // import.meta.env.VITE_* はViteのビルド時に静的に埋め込まれる。
-  const endpoint = import.meta.env.VITE_RESEARCH_ENDPOINT;
-  return typeof endpoint === "string" && endpoint.length > 0 ? endpoint : null;
-}
+export const EXPERIMENT_SCHEMA_VERSION = "experiment-v3";
 
 export function isSubmissionConfigured(): boolean {
-  return getConfiguredEndpoint() !== null;
+  return isEndpointConfigured();
 }
 
 // endpointが未設定ならネットワークアクセスなしで"local_only"を返す。
 // endpoint設定済みなら実際にPOSTし、成功/失敗を返す(ここではlocalStorageを更新しない)。
 export async function submitExperiment(experiment: ResearchExperiment): Promise<SubmissionOutcome> {
-  const endpoint = getConfiguredEndpoint();
-  if (!endpoint) {
+  if (!isEndpointConfigured()) {
     return { status: "local_only" };
   }
 
-  try {
-    const payload = buildExperimentSubmissionPayload(experiment);
-    const res = await fetch(endpoint, {
-      method: "POST",
-      headers: { "Content-Type": "text/plain;charset=UTF-8" },
-      body: JSON.stringify(payload),
-    });
-    if (!res.ok) {
-      return { status: "failed", error: `HTTP ${res.status}` };
-    }
-    return { status: "sent" };
-  } catch (err) {
-    return { status: "failed", error: err instanceof Error ? err.message : String(err) };
+  const payload = buildExperimentSubmissionPayload(experiment);
+  const result = await postToAppsScript({
+    request_type: "experiment",
+    schema_version: EXPERIMENT_SCHEMA_VERSION,
+    payload,
+  });
+  if (!result.ok) {
+    return { status: "failed", error: result.error };
   }
+  return { status: "sent" };
 }
 
 // 送信を試み、結果をresearchHistoryのsubmission_statusへ反映する。

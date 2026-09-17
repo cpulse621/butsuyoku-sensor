@@ -57,7 +57,6 @@ function makeExperiment(overrides: Partial<ResearchExperiment> = {}): ResearchEx
     active_duration_ms: 55000,
     resume_count: 0,
     draw_detail_count: 42,
-    draw_detail_status: "local_only",
     coin_initial: 100000,
     coin_remaining: 100000,
     coin_used: 0,

@@ -4,6 +4,8 @@ import { EvilSpiritDataset, MadmanDataset, WatchersDataset } from "motsuyoku-sen
 import { SimulatorView } from "./SimulatorView";
 import { ResearchView } from "./ResearchView";
 import { retryAllPendingSubmissions } from "./services/researchSubmission";
+import { syncResearchDrawsForExperiment } from "./services/researchDrawsSubmission";
+import { listExperiments } from "./storage/researchHistory";
 
 const DATASETS: GemDataset[] = [WatchersDataset, MadmanDataset, EvilSpiritDataset];
 
@@ -14,9 +16,19 @@ export default function App() {
   const [dataset, setDataset] = useState<GemDataset>(WatchersDataset);
 
   // 起動時、送信先が設定されていて未送信(pending/failed)のまま残っている研究データがあれば
-  // 安全に再送を試みる(同一experiment_idの再送はApps Script側のduplicate処理に委ねる)。
+  // 安全に再送を試みる(同一experiment_idの再送・同一chunkの再送はApps Script側のdedupeに委ねる)。
+  // ResearchDrawsは(draw_detail_statusのような永続的な送信状態を持たない設計のため)独立した
+  // 「未送信」判定ができないが、Experiments側がpending/failedのexperiment_idはResearchDrawsも
+  // 未送信である可能性が高いため、同じ対象へまとめて再送を試みておく(ヒューリスティック)。
   useEffect(() => {
     void retryAllPendingSubmissions();
+    void (async () => {
+      const atRisk = listExperiments().filter((e) => e.submission_status === "pending" || e.submission_status === "failed");
+      for (const experiment of atRisk) {
+        // eslint-disable-next-line no-await-in-loop
+        await syncResearchDrawsForExperiment(experiment.experiment_id);
+      }
+    })();
   }, []);
 
   return (

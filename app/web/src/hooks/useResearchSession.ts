@@ -16,6 +16,7 @@ import { DRAW_DETAIL_SCHEMA_VERSION } from "../storage/researchDrawsDb";
 import { toStoredTarget, storedTargetToTarget, buildTargetLabelSnapshot } from "../lib/targetSummary";
 import type { TargetLabelSnapshot } from "../lib/targetSummary";
 import { attemptSubmission, isSubmissionConfigured } from "../services/researchSubmission";
+import { syncResearchDrawsForExperiment } from "../services/researchDrawsSubmission";
 import type { SurveyFormAnswers } from "../components/SurveyForm";
 import { COIN_COST_MODEL_VERSION, COIN_COST_OPTIONS, INITIAL_COIN, computeNormalizedSurprisalCost } from "../lib/coinCost";
 import webPackageJson from "../../package.json";
@@ -537,7 +538,7 @@ export function useResearchSession() {
     });
   }, [drawAdvanceMode]);
 
-  function finalize(
+  async function finalize(
     session: CoreSession,
     extra: { surveyAnswers: SurveyAnswers | null; exitReason: ExitReason | null; terminationReason: TerminationReason }
   ) {
@@ -560,6 +561,16 @@ export function useResearchSession() {
 
     const absoluteRollCountAtEnd = meta.rollOffset + summary.rollCount;
     const activeDurationMs = getActiveMsNow();
+
+    // draw_detail_count(ResearchDrawsに実際にローカル記録されているvisible drawの期待件数)は
+    // 送信前にここで確定させる。後からExperiments行を更新しに行くAPIを不要にするため
+    // (docs/apps_script_v3_spec.md 8節)、非同期の後追い更新はしない。
+    let drawDetailCount = absoluteRollCountAtEnd;
+    try {
+      drawDetailCount = await researchDrawsDb.countDrawsForExperiment(meta.experimentId);
+    } catch {
+      // IndexedDBが読めなくても実験結果自体の保存は止めない(rollCountをfallbackとして使う)。
+    }
 
     const record: ResearchExperiment = {
       experiment_id: meta.experimentId,
@@ -602,8 +613,7 @@ export function useResearchSession() {
       reveal_interval_ms: REVEAL_ITEM_DELAY_MS,
       active_duration_ms: activeDurationMs,
       resume_count: resumeCountRef.current,
-      draw_detail_count: 0, // ResearchDraws(正本)の実カウントで下から非同期に確定させる
-      draw_detail_status: "local_only",
+      draw_detail_count: drawDetailCount,
       // coin_used = coin_initial - (符号付きの)coinRemainingRef.current。coin_exhausted時は
       // 最後のdrawのオーバーシュート分だけcoin_initialを超えることがある(実消費量として正確)。
       // coin_remainingは表示・レコードとも下限0でclampする(参加者へ負の残高を見せない)。
@@ -622,17 +632,9 @@ export function useResearchSession() {
     setIsRetiring(false);
     setPhase("revealed");
 
-    // draw_detail_count(ResearchDrawsの実カウント)は非同期にしか取得できないため、
-    // 確定した時点でExperiments側のレコードとUI表示の両方を更新する。
-    void researchDrawsDb
-      .countDrawsForExperiment(meta.experimentId)
-      .then((count) => {
-        researchStore.updateExperimentDrawDetailCount(record.experiment_id, count);
-        setFinalRecord((prev) => (prev && prev.experiment_id === record.experiment_id ? { ...prev, draw_detail_count: count } : prev));
-      })
-      .catch(() => {
-        // 件数確認ができなくても実験結果自体は既に保存済みのため、致命的ではない。
-      });
+    // ResearchDraws(このexperiment_idでローカルに記録済みの全visible draw)をchunk送信する。
+    // Experimentsの送信結果とは独立して進める(片方が失敗しても他方のローカルデータは失われない)。
+    void syncResearchDrawsForExperiment(meta.experimentId);
 
     // ローカル保存が完了した後にのみ送信を試みる。失敗してもローカルの記録は失われない。
     if (record.submission_status === "pending") {
@@ -702,6 +704,9 @@ export function useResearchSession() {
     if (outcome.status !== "local_only") {
       setFinalRecord((prev) => (prev && prev.experiment_id === current.experiment_id ? { ...prev, submission_status: outcome.status } : prev));
     }
+    // Experimentsの再送と合わせて、このexperiment_idのResearchDrawsも改めて送り直す
+    // (両者は独立した送信経路であり、片方だけ失敗していることがあるため)。
+    void syncResearchDrawsForExperiment(current.experiment_id);
   }, []);
 
   const reset = useCallback(() => {
