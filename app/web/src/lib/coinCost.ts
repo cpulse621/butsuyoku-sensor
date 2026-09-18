@@ -18,8 +18,11 @@
 // 「平均的にどれだけのdrawに相当するcoin予算を用意するか(budget horizon)」を実質的に決める
 // 1つのパラメータである(E[cost] = baseなので、期待値上は initial_coin / base 回のdrawで
 // budgetを使い切る計算になる)。initial_coin=100,000・base=100なので、budget horizonは
-// 平均的に約1,000draw相当(researchEligibleの上限expected_draws<=1,000と対応させている。
-// lib/researchEligibility.ts参照)。
+// 平均的に約1,000draw相当。この値は当初、Target選択UIのresearchEligible上限
+// (expected_draws<=1,000)と対応させて決めたものだが、2026-09-19にresearchEligibleの
+// 確率による足切りは撤廃した(lib/researchEligibility.ts参照)。coinのbudget horizon自体は
+// 独立した仕組みとして維持しており、低確率なTargetを選んだ場合は「Target Match前にcoinが
+// 尽きる(coin_exhausted)」という形で実験が自然に終了する。
 
 export const COIN_COST_MODEL_ID = "dataset_normalized_surprisal";
 // このモデルの実装バージョン。式やパラメータの意味が変わったら上げる。

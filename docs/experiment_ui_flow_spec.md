@@ -23,6 +23,7 @@
   - coin<=0かつTarget未達の場合、`termination_reason = "coin_exhausted"`として事後アンケート(Q1〜Q5)後に直接finalizeする(退出理由は挟まない。participant_giveupとは明確に区別する)。同一drawでTarget Matchとcoin exhaustionが同時発生した場合はTarget Matchを優先する(3.6/3.8節)。
   - `ResearchExperiment`に`coin_initial`/`coin_remaining`/`coin_used`を追加し、試行回数・残りコイン・使用コインを研究中常時表示するようにした(6.1節)。
   - Apps Script/Google Sheets ResearchDraws送信、Analysisクエリの拡張は次セッションへ持ち越し(未着手)。
+- v0.6(2026-09-19): **researchEligibleの確率による足切りを撤廃。** 学内での検討により「低確率であること自体を理由にTargetを選択不可にしない」という方針が確定した。`isTargetResearchEligible()`の判定基準を`expected_draws <= 1,000`から`p > 0`(ProbabilityEngine上で理論確率を正しく計算できるかどうか)へ変更した(3.8.3節参照。3.8.2節のシミュレーション自体は、この方針変更前に`expected_draws <= 1,000`という具体的なしきい値をどう決めたかの記録として残す)。`RESEARCH_ELIGIBLE_MAX_EXPECTED_DRAWS`定数は削除した。coinのbudget horizon(`INITIAL_COIN`/`COIN_COST_OPTIONS`)自体は変更していない: 低確率なTargetを選んだ場合、Target Match前にcoinが尽きる(`coin_exhausted`)という形で実験が自然に終了する、という既存の独立した仕組みがそのまま働く。DrawEngine/ProbabilityEngineの確率分布・排他ロジックは一切変更していない。EffectPool/排他条件上そもそも成立しない(p=0の)組み合わせは、従来どおり選択不可のまま。
 
 ---
 
@@ -182,14 +183,14 @@ Coreの`createResearchModeSession()`はクロージャ内部にRNGの消費位�
 
 この結果から、**researchEligibleを`expected_draws ≦ 1,000`に確定した**: この帯までは過半数(約63%以上)が成功し、かつ約4割弱が`coin_exhausted`を経験するため、「全員がほぼ確実に成功する」設計を避けつつ、「投入したresourceに結果が見合わなかった感覚」を一定割合の参加者に生じさせられる。`expected_draws`が1,250を超えると成功率が5割を切り、2,000では約4割まで下がるため、研究目的（不運の程度と主観評価の関係を見る）に対して厳しすぎると判断した。
 
-### 3.8.3 researchEligibleのUI実装
+### 3.8.3 researchEligibleのUI実装(v0.6で確率による足切りを撤廃)
 
-`app/web/src/lib/researchEligibility.ts`の`isTargetResearchEligible(dataset, target)`が、`computeProbability(dataset, target).approxOneInN <= 1000`かどうかを判定する。`ResearchView.tsx`のTarget設定画面がこれを使い、Targetが完成した時点で判定し、
+**v0.6時点の仕様**: `app/web/src/lib/researchEligibility.ts`の`isTargetResearchEligible(dataset, target)`が、`computeProbability(dataset, target).p > 0`かどうかだけを判定する。低確率であること自体を理由にTargetを選択不可にはしない(方針確定。撤廃前の`expected_draws <= 1,000`というしきい値と、それをどう決めたかの記録は3.8.2節・v0.5changelog参照)。`ResearchView.tsx`のTarget設定画面がこれを使い、Targetが完成した時点で判定し、
 
-- eligibleなら通常どおり「次へ（欲しさ評価）」→「実験を開始」ボタンを表示する。
-- eligibleでなければ、両ボタンとも表示せず「この組み合わせは条件が厳しすぎるため、研究モードでは選択できません。形状・ランク・許容デメリットの範囲を広げるなど、条件を変更してください。」という案内だけを表示する。**実際のp/expected_draws自体は開示しない**（理論確率は実験終了後まで非公開、という既存方針を維持する）。
+- p>0(eligible)なら通常どおり「次へ（欲しさ評価）」→「実験を開始」ボタンを表示する。極端に低確率なTargetであっても、この判定だけでは弾かない。
+- p=0(EffectPool/排他条件上そもそも成立しない組み合わせ。例: primary/secondaryが同一effectIdでallowDuplicateSecondary=falseの場合、存在しない効果IDを指定した場合)の場合のみ、両ボタンとも表示せず「この組み合わせは実際には出現しえないため、研究モードでは選択できません。1op・2opの組み合わせなど、条件を変更してください。」という案内だけを表示する。**実際のp/expected_draws自体は開示しない**（理論確率は実験終了後まで非公開、という既存方針を維持する）。
 
-この判定はTarget選択UI(研究モードのみ)だけに適用され、DrawEngineの抽選プール・ProbabilityEngineの確率計算・Simulator modeには一切影響しない。
+この判定はTarget選択UI(研究モードのみ)だけに適用され、DrawEngineの抽選プール・ProbabilityEngineの確率計算・Simulator modeには一切影響しない。coinのbudget horizon(3.8節)は本判定とは独立した仕組みとして維持されており、極端に低確率なTargetを選んだ場合は「Target Match前にcoinが尽きる(`coin_exhausted`)」という形で実験が自然に終了する。
 
 ### 3.8.4 コインの常時表示
 
@@ -272,7 +273,7 @@ Apps ScriptへのResearchDraws送信（chunk化・`experiment_id + draw_index`�
 
 - Apps Script側: Experiments列のflatten対応・ResearchDraws受信endpointの実装（現物確認後に対応。**次セッションの作業**）
 - Analysisクエリの拡張（P節で挙げた比較群: 理論期待回数vs実際、客観的不運度vssensor_score、coin消費vssensor_score/effort_reward_fit_score等）。まずAnalysis用のraw data収集を優先し、分析方向は先に決めない方針を維持する。**次セッションの作業**
-- `researchEligible`のしきい値（`expected_draws <= 1,000`）・コインコスト式（base=100/round/minCost=1）・初期coin（100,000）はすべて確定済み（以前のTBDを解消）
+- `researchEligible`は確率による足切りを撤廃し`p > 0`のみで判定する方式に確定（v0.6、3.8.3節）。コインコスト式（base=100/round/minCost=1）・初期coin（100,000）も確定済み（以前のTBDを解消）
 - コインのproduction配線・Q5スライダーの刻み・Target表示情報のsnapshot生成時点・`research_protocol_version`の命名は確定済み（以前のTBDを解消）
 
 ---

@@ -65,10 +65,12 @@ export function ResearchView({ datasets, dataset, onSelectDataset }: Props) {
 
   const eligibleCurseIds = new Set(eligibleCurses.map((c) => c.curseId));
 
-  // researchEligible(指示5節): expected_draws<=1,000のTargetのみ研究モードで選択できる。
-  // Target選択UIだけのfilterであり、DrawEngineの抽選プール・確率分布には一切影響しない。
-  // Simulator modeにはこの上限を適用しない(こちらはResearchViewにのみ存在するロジック)。
-  // 参加者へは可否だけを伝え、実際のp/expected_draws自体は開示しない。
+  // researchEligible(2026-09-19確定): 低確率であること自体を理由にTargetを選択不可にはしない。
+  // ProbabilityEngine上でp>0(理論確率を正しく計算できる)であれば選択可能。EffectPool/排他条件上
+  // そもそも成立しない(p=0の)組み合わせのみ選択不可のまま。Target選択UIだけのfilterであり、
+  // DrawEngineの抽選プール・確率分布には一切影響しない。Simulator modeにはこの判定を適用しない
+  // (こちらはResearchViewにのみ存在するロジック)。参加者へは可否だけを伝え、実際のp/expected_draws
+  // 自体は開示しない。
   const isTargetEligible = useMemo(() => (target ? isTargetResearchEligible(dataset, target) : true), [dataset, target]);
 
   function handleStartExperiment() {
@@ -253,7 +255,7 @@ export function ResearchView({ datasets, dataset, onSelectDataset }: Props) {
             {target && isTargetEligible && <p className="hint">Targetが設定されました。下へ進んでください。</p>}
             {target && !isTargetEligible && (
               <p className="hint">
-                この組み合わせは条件が厳しすぎるため、研究モードでは選択できません。形状・ランク・許容デメリットの範囲を広げるなど、条件を変更してください。
+                この組み合わせは実際には出現しえないため、研究モードでは選択できません。1op・2opの組み合わせなど、条件を変更してください。
               </p>
             )}
           </div>

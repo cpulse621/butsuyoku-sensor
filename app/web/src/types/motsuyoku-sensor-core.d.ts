@@ -170,7 +170,6 @@ declare module "motsuyoku-sensor-core" {
     acceptedSecondaryRanks?: number[];
     acceptedCurses: string[];
     desireScore?: 1 | 2 | 3 | 4 | 5;
-    researchEligible?: boolean;
   }
 
   // ---- ProbabilityEngine (spec 4節/7節) ----
