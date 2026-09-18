@@ -58,7 +58,12 @@ export function ResearchRunningLayout({
   onResumeAuto,
   onGiveUp,
 }: Props) {
+  // 保存失敗後は、このsessionでの操作を一切許可しない(復帰はページ再読み込みのみ)。
+  // hook側(persistenceBlockedRef)でも同じ内容をガードしているが、ボタン自体も無効化しておく。
+  const blocked = !!researchDrawsSaveError;
+
   function handleGiveUpClick() {
+    if (blocked) return;
     const confirmed = window.confirm("目的の血晶が出る前に実験を終了しますか？");
     if (confirmed) onGiveUp();
   }
@@ -132,7 +137,7 @@ export function ResearchRunningLayout({
 
       <div className="research-run-shell__footer">
         {drawAdvanceMode === "manual" ? (
-          <button type="button" className="primary-button research-run-shell__advance" onClick={onRevealBatch} disabled={isRevealing}>
+          <button type="button" className="primary-button research-run-shell__advance" onClick={onRevealBatch} disabled={isRevealing || blocked}>
             {isRevealing ? "抽選中…" : "次の10連"}
           </button>
         ) : (
@@ -141,12 +146,13 @@ export function ResearchRunningLayout({
             isPaused={isAutoPaused}
             onPause={onPauseAuto}
             onResume={onResumeAuto}
-            disabled={isRevealing}
+            disabled={isRevealing || blocked}
           />
         )}
         {/* 結果を順次表示している最中でも「実験を終了する」は使えるままにする(指示#8)。
-            押した瞬間、hook側(giveUp)が表示中のrevealBatchループへ即座に停止を伝える。 */}
-        <button type="button" className="danger-button" onClick={handleGiveUpClick}>
+            押した瞬間、hook側(giveUp)が表示中のrevealBatchループへ即座に停止を伝える。
+            ただし保存失敗後(blocked)は、Coreの状態がもう信頼できないためgiveUpも禁止する。 */}
+        <button type="button" className="danger-button" onClick={handleGiveUpClick} disabled={blocked}>
           実験を終了する
         </button>
       </div>

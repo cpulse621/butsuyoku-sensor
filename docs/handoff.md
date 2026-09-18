@@ -13,7 +13,7 @@
 - コインシステム: `coin_cost = max(1, round(100 × I(g)/H(dataset)))`、`initial_coin = 100,000`。試行回数・残りコイン・使用コインを研究中常時表示。coin<=0かつTarget未達なら`termination_reason="coin_exhausted"`として事後アンケート後に直接finalize(退出理由は挟まない。participant_giveupとは区別)。同一drawでTarget Matchと同時発生した場合はTarget Matchを優先
 - `researchEligible`: `expected_draws <= 1,000`を研究モードのTarget選択UIにのみ適用(`app/web/src/lib/researchEligibility.ts`)。DrawEngineの分布・Simulator modeには影響しない
 
-DrawEngine/ProbabilityEngine(app/core)自体はこの一連の作業を通じて一切変更していない(Fidelity Contract・確率モデルは不変)。テスト: Core 44/44(`node --test`。ワークスペースの`npm test`スクリプトはNode 24環境で`node --test test/`の解釈が変わり動かないことがあるが、コード自体の問題ではない)、Web 124/124、TypeScript・productionビルドともに成功。加えて`apps_script/Code.test.js`(Node組み込み`node:test`。GASグローバルをスタブ化したサンドボックス実行、`node --test apps_script/Code.test.js`)16/16。
+DrawEngine/ProbabilityEngine(app/core)自体はこの一連の作業を通じて一切変更していない(Fidelity Contract・確率モデルは不変)。テスト: Core 44/44(`node --test`。ワークスペースの`npm test`スクリプトはNode 24環境で`node --test test/`の解釈が変わり動かないことがあるが、コード自体の問題ではない)、Web 137/137、TypeScript・productionビルドともに成功。加えて`apps_script/Code.test.js`(Node組み込み`node:test`。GASグローバルをスタブ化したサンドボックス実行、`node --test apps_script/Code.test.js`)17/17。
 
 クライアント側のResearchDraws送信処理も実装済み: `services/researchDrawsSubmission.ts`が250件/chunkで`request_type: "research_draws_chunk"`のenvelopeを送信し、`finalize()`・`resendFinalRecord()`・`ResearchHistoryPanel`の再送に配線済み。`services/researchSubmission.ts`もExperimentsを`request_type: "experiment"`のenvelopeで送るよう変更済み(旧`request_type`無しPOSTとの後方互換はApps Script側で担保する前提)。**2026-09-18: 起動時/オンライン復帰時の自動再送は、ExperimentsとResearchDrawsを完全に独立させた(`services/retryUnsentData.ts`)**。詳細は後述。
 
@@ -53,6 +53,16 @@ DrawEngine/ProbabilityEngine(app/core)自体はこの一連の作業を通じて
 - ResearchDraws側にも、chunk size上限(500)超過での拒否・`body.experiment_id`と各`draw.experiment_id`の不一致検出(不一致ならchunk全体失敗)・`draw_index`が正の整数であることの検証を追加した。
 - **既存Sheetsの行(不完全な空行を含む)は一切変更・削除・backfillしていない**。今回の分の不完全な行はpilot/incompleteなデータとしてそのまま残る。分析時にはこれらを区別すること(`submission_status='sent'`だが主要フィールドが空、という行が該当する)。
 - 検証は`apps_script/Code.test.js`(Node組み込み`node:test`)で行っている。詳細は`docs/apps_script_v3_spec.md`9節・`apps_script/README.md`参照。
+
+### 追補: 本番反映前レビューで見つかった2つのblocker + 1つのhardening(2026-09-18続き)
+
+上記A〜Cのcommit後のレビューで、以下を追加修正した。研究条件・確率モデル・Apps Scriptの既存仕様(重複検知・行探索・safeValue_等)は変更していない。
+
+**D. appendDraw失敗後もCore内部のrollCount/phaseだけが進んでしまう問題**: Aの修正だけでは、appendDraw失敗時にUI/checkpointは止まるが、`session.revealNext()`は既に呼ばれておりCore内部のrollCount/phaseは進んでしまっていた(Coreは巻き戻せない)。同一Coreセッションで「次の10連」を再試行すると、絶対draw_indexに欠番ができる・Core rollCountとResearchDrawsがずれる・失敗したdrawがTarget Matchだった場合にCoreだけAWAITING_SURVEYになる、という問題があった。**修正**: `persistenceBlockedRef`を追加し、保存失敗後はそのCoreセッションを完全に停止させる(`revealBatch`・autoの自動進行・`giveUp`すべてをこのrefでブロックする。stale closureに依存しないrefベースのガード)。Core側がAWAITING_SURVEYになっていてもsurveyへは進めない。表示文言も「もう一度次の10連を押してください」から「ページを再読み込みし、『続きから』を選んでください」へ変更した(`RESEARCH_DRAWS_SAVE_FAILURE_MESSAGE`)。復帰はページ再読み込み→`resumeExperiment()`(ResearchDraws/checkpointからの復元。既存のAの仕組みでそのまま正しく動く)のみ。
+
+**E. Apps Scriptの`ok:false`応答をsent扱いしてしまう問題**: `services/researchSubmission.ts`の`submitExperiment()`が、HTTPレベルで200が返っただけでレスポンスJSONの中身を見ずに`sent`を返していた。Apps Scriptはvalidation failure等でもHTTP 200で`{ok:false, error:"..."}`を返すため、Cの厳格validationを追加しても、クライアント側では失敗が`sent`として記録されてしまう欠陥があった。**修正**: レスポンスJSONを`parseExperimentAck()`で検証し、`json.ok === true`の場合のみ`sent`とする(`duplicate:true`も`ok:true`なので`sent`でよい)。`ok:false`・JSONがnull・JSON形状不正はいずれも`failed`とし、Apps Script側のエラー文字列があれば`SubmissionOutcome.error`へ残す。`retryAllPendingSubmissions`による事後再送は従来どおり機能する。
+
+**F. Code.gsの未知request_type**: `request_type`が`"experiment"`/`"research_draws_chunk"`以外の未知の文字列だった場合、従来はlegacyとして`handleExperiment_`へ流れてしまう余地があった。**修正**: `request_type`が明示的に存在するが上記2値のいずれでもない場合は`{ok:false, error:"unknown_request_type"}`で拒否し、legacyとして保存しない。`request_type`が全く無い(`undefined`)場合のみ従来どおりlegacy扱いにする。
 
 ## 次にやること(このセッションでは着手していない)
 

@@ -26,6 +26,17 @@ export function isSubmissionConfigured(): boolean {
   return isEndpointConfigured();
 }
 
+// Apps Scriptのレスポンス本文を検証する。HTTPレベルで200が返っただけでは成功とみなさない:
+// Apps Scriptはvalidation failure等でもHTTP 200で{ok:false, error:"..."}を返すため
+// (例: experiment_validation_failed)、json.ok===trueであることを明示的に確認する。
+// duplicate:trueもok:trueなのでsent扱いでよい(既存experiment_idの再送を示すだけで失敗ではない)。
+function parseExperimentAck(json: unknown): { ok: boolean; error?: string } | null {
+  if (!json || typeof json !== "object") return null;
+  const { ok, error } = json as Record<string, unknown>;
+  if (typeof ok !== "boolean") return null;
+  return { ok, error: typeof error === "string" ? error : undefined };
+}
+
 // endpointが未設定ならネットワークアクセスなしで"local_only"を返す。
 // endpoint設定済みなら実際にPOSTし、成功/失敗を返す(ここではlocalStorageを更新しない)。
 export async function submitExperiment(experiment: ResearchExperiment): Promise<SubmissionOutcome> {
@@ -41,6 +52,11 @@ export async function submitExperiment(experiment: ResearchExperiment): Promise<
   });
   if (!result.ok) {
     return { status: "failed", error: result.error };
+  }
+
+  const ack = parseExperimentAck(result.json);
+  if (!ack || ack.ok !== true) {
+    return { status: "failed", error: ack?.error ?? "invalid or missing acknowledgement from Apps Script" };
   }
   return { status: "sent" };
 }

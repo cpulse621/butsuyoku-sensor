@@ -44,6 +44,12 @@ function pickAutoIntervalMs(): number {
 // 「前回の実験を再開しました」通知を自動的に消すまでの時間。
 export const RESUME_NOTICE_AUTO_DISMISS_MS = 5000;
 
+// ResearchDraws(IndexedDB)への保存に失敗した際の表示文言。Coreの内部状態(rollCount/phase)は
+// 保存失敗したdrawについても既に進んでしまっており巻き戻せないため、同一session内での再試行は
+// 案内しない(「もう一度次の10連を押してください」とは言わない)。復帰はreload+resumeのみ。
+export const RESEARCH_DRAWS_SAVE_FAILURE_MESSAGE =
+  "研究データの保存に失敗しました。ページを再読み込みし、「続きから」を選んでください。";
+
 export type UiPhase = "idle" | "running" | "awaiting_survey" | "awaiting_exit_reason" | "revealed";
 
 export interface RevealedEntry {
@@ -235,6 +241,12 @@ export function useResearchSession() {
   const pendingSurveyAnswersRef = useRef<SurveyAnswers | null>(null);
   const pauseStartedAtRef = useRef<number | null>(null);
   const stopRequestedRef = useRef(false);
+  // ResearchDraws(IndexedDB)への保存が1件でも失敗したら、このCoreセッションを以後一切
+  // 進行させない(revealBatch/auto双方をブロックする)。Coreのrevealnext()は既に呼ばれて
+  // 内部状態(rollCount/phase)が進んでしまっており巻き戻せないため、同一session内での
+  // 再試行は許可しない。復帰はreload→resumeExperiment(ResearchDraws/checkpointからの
+  // 復元)のみ。useCallbackのstale closureに依存しないよう、必ずrefで判定する。
+  const persistenceBlockedRef = useRef(false);
 
   function startActivePeriodIfNeeded() {
     if (activePeriodStartRef.current === null) activePeriodStartRef.current = Date.now();
@@ -372,6 +384,7 @@ export function useResearchSession() {
     pauseStartedAtRef.current = null;
     stopRequestedRef.current = false;
     isRevealingRef.current = false;
+    persistenceBlockedRef.current = false;
 
     activeMsBaseRef.current = resumeOffsets?.activeMsBase ?? 0;
     activeAccumulatedRef.current = 0;
@@ -476,6 +489,7 @@ export function useResearchSession() {
   // (指示: 「reload直前に提示済みだったdrawが失われないように」10連の完了を待たずcheckpointする)。
   const revealBatch = useCallback(async () => {
     if (isRevealingRef.current) return; // 表示中の連打・二重発火を防ぐ(10件の提示完了まで次を開始しない)
+    if (persistenceBlockedRef.current) return; // 保存失敗後、reloadされるまでこのsessionは進行させない
     const session = sessionRef.current;
     const meta = metaRef.current;
     if (!session || !meta || uiPhase !== "running") return;
@@ -539,14 +553,16 @@ export function useResearchSession() {
       }
 
       if (!saved) {
-        // 指示1節E項: 研究データの欠損を黙って握りつぶさない。UIへ保存失敗を表示し、
-        // このdraw以降を正常保存済みとして扱わない(checkpoint/coin/表示のいずれも進めずここで停止)。
-        // このdraw自体はCore内部では既にrevealNext()済み(乱数消費)だが、確定保存できなかった
-        // ため参加者へは見せない。draw_indexの欠番はAnalysis時にdraw_detail_countとの
-        // 突き合わせで検知できる(Experiments/ResearchDrawsの完全性判定は既存方針のまま)。
-        setResearchDrawsSaveError(
-          "研究データの保存に失敗しました。この試行は記録されていません。ページを閉じずに、もう一度「次の10連」をお試しください。"
-        );
+        // 研究データの欠損を黙って握りつぶさない。UIへ保存失敗を表示し、このdraw以降を
+        // 正常保存済みとして扱わない(checkpoint/coin/表示のいずれも進めずここで停止)。
+        // このdraw自体はCore内部では既にrevealNext()済み(乱数消費・rollCount/phase前進)であり
+        // 巻き戻せないため、同一Coreセッションはここで完全に停止させる(persistenceBlockedRef)。
+        // 復帰はページ再読み込み→resumeExperiment(ResearchDraws/checkpointからの復元)のみとし、
+        // 同一session内での再試行は一切許可しない(draw_indexの欠番・Core/ResearchDrawsの
+        // 不整合・Target Matchの取りこぼしを防ぐ)。このdraw自体は参加者に提示されず、
+        // 公式streamにも存在しないdrawとして破棄する。
+        persistenceBlockedRef.current = true;
+        setResearchDrawsSaveError(RESEARCH_DRAWS_SAVE_FAILURE_MESSAGE);
         stopRequestedRef.current = true;
         break;
       }
@@ -583,6 +599,14 @@ export function useResearchSession() {
 
     isRevealingRef.current = false;
     setIsRevealing(false);
+
+    if (persistenceBlockedRef.current) {
+      // 保存失敗によりCoreの状態はもう信頼できない。Core側がAWAITING_SURVEYになっていても
+      // (=保存に失敗したdrawがTarget Matchだった場合)、surveyへは進めない。
+      // autoの次バッチ予約も行わない。reload→resumeExperimentでの復帰のみを案内する。
+      return;
+    }
+
     const phaseAfterBatch: string = session.phase;
     if (phaseAfterBatch === ResearchModePhases.AWAITING_SURVEY || pendingCoinExhaustedRef.current) {
       setPhase("awaiting_survey");
@@ -598,6 +622,7 @@ export function useResearchSession() {
     if (drawAdvanceMode !== "auto") return;
     if (isRevealing) return;
     if (isAutoPaused) return;
+    if (persistenceBlockedRef.current) return; // 保存失敗後はautoも再開しない(reloadのみが復帰経路)
     if (autoRemainingMs <= 0) {
       void revealBatch();
       return;
@@ -788,6 +813,10 @@ export function useResearchSession() {
   const giveUp = useCallback(() => {
     const session = sessionRef.current;
     if (!session || uiPhase !== "running") return;
+    // 保存失敗後はgiveUp()も禁止する: Core内部のrollCountは既に確定保存できなかったdraw分だけ
+    // 先へ進んでしまっており、ここでgiveUp()するとcutoff_drawsがResearchDrawsの実際の記録と
+    // ずれた値で確定してしまう。復帰はreload→resumeExperimentのみ。
+    if (persistenceBlockedRef.current) return;
     stopRequestedRef.current = true; // revealBatchが実行中なら即座に停止させる
     pendingGiveUpRef.current = true;
     setIsRetiring(true);
@@ -816,6 +845,7 @@ export function useResearchSession() {
     pauseStartedAtRef.current = null;
     stopRequestedRef.current = false;
     isRevealingRef.current = false;
+    persistenceBlockedRef.current = false;
     activeMsBaseRef.current = 0;
     activeAccumulatedRef.current = 0;
     activePeriodStartRef.current = null;

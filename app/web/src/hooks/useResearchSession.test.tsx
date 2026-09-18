@@ -1365,4 +1365,130 @@ describe("hooks/useResearchSession", () => {
       expect(snapshot?.checkpoint_draw_index).toBe(3); // checkpointも3件目までしか進んでいない
     });
   });
+
+  describe("保存失敗後は同一sessionを続行しない(Coreは巻き戻せないため)", () => {
+    it("draw 7のappendDrawが失敗すると、UI rollCount/checkpointは6のまま、そのsessionではそれ以上revealNextされない", async () => {
+      mocks.appendDrawFailOnCallNumber = 7;
+      const fake = createFakeCoreSession(null); // 通常miss想定(MATCHなし)
+      mocks.sessionFactory = () => fake;
+      const { result } = renderHook(() => useResearchSession());
+
+      act(() => {
+        result.current.startExperiment(TEST_DATASET, TEST_TARGET, 3);
+      });
+      const experimentId = loadActiveExperiment()!.experiment_id;
+
+      await act(async () => {
+        await result.current.revealBatch();
+      });
+
+      expect(result.current.rollCount).toBe(6);
+      expect(result.current.currentBatchRevealed).toHaveLength(6);
+      expect(result.current.researchDrawsSaveError).toBe(
+        "研究データの保存に失敗しました。ページを再読み込みし、「続きから」を選んでください。"
+      );
+      expect(fake.revealNextCallCount).toBe(7); // 7回目はCore内部では既に呼ばれている(巻き戻せない)
+
+      const rows = await listDrawsForExperiment(experimentId);
+      expect(rows).toHaveLength(6);
+      const snapshot = loadActiveExperiment();
+      expect(snapshot?.checkpoint_draw_index).toBe(6);
+
+      // 同一session内でもう一度「次の10連」を押しても、一切進行しない(persistenceBlockedRef)。
+      await act(async () => {
+        await result.current.revealBatch();
+      });
+      expect(fake.revealNextCallCount).toBe(7); // 増えていない
+      expect(result.current.rollCount).toBe(6);
+      expect(result.current.uiPhase).toBe("running");
+    });
+
+    it("失敗したdrawがTarget Matchだった場合でも、surveyへは進まない", async () => {
+      // 1件目でMATCHするfakeだが、その1件目のappendDrawを失敗させる。
+      mocks.appendDrawFailOnCallNumber = 1;
+      const fake = createFakeCoreSession(1);
+      mocks.sessionFactory = () => fake;
+      const { result } = renderHook(() => useResearchSession());
+
+      act(() => {
+        result.current.startExperiment(TEST_DATASET, TEST_TARGET, 3);
+      });
+
+      await act(async () => {
+        await result.current.revealBatch();
+      });
+
+      // Core内部はAWAITING_SURVEYへ進んでいるはずだが、hook側のuiPhaseはrunningのまま。
+      expect(fake.phase).toBe("awaiting_survey");
+      expect(result.current.uiPhase).toBe("running");
+      expect(result.current.rollCount).toBe(0);
+      expect(result.current.currentBatchRevealed).toHaveLength(0);
+      expect(result.current.researchDrawsSaveError).not.toBeNull();
+    });
+
+    it("保存失敗後はgiveUp()も禁止される(Core rollCountが確定保存分より先に進んでいるため)", async () => {
+      mocks.appendDrawFailOnCallNumber = 1;
+      const fake = createFakeCoreSession(null);
+      mocks.sessionFactory = () => fake;
+      const { result } = renderHook(() => useResearchSession());
+
+      act(() => {
+        result.current.startExperiment(TEST_DATASET, TEST_TARGET, 3);
+      });
+      await act(async () => {
+        await result.current.revealBatch();
+      });
+      expect(result.current.researchDrawsSaveError).not.toBeNull();
+
+      act(() => {
+        result.current.giveUp();
+      });
+      expect(result.current.uiPhase).toBe("running"); // awaiting_surveyへ進まない(giveUpが無視された)
+      expect(result.current.finalRecord).toBeNull();
+    });
+
+    it(
+      "reload(新しいhookインスタンス)してresumeすると、最後の保存成功drawから再開し、欠番が発生しない",
+      async () => {
+        mocks.appendDrawFailOnCallNumber = 7;
+        const fake = createFakeCoreSession(null, "pthumeru_depth5_standard_watchers_v0_1");
+        mocks.sessionFactory = () => fake;
+        const { result } = renderHook(() => useResearchSession());
+
+        act(() => {
+          result.current.startExperiment(
+            { ...TEST_DATASET, datasetId: "pthumeru_depth5_standard_watchers_v0_1" },
+            { ...TEST_TARGET, datasetId: "pthumeru_depth5_standard_watchers_v0_1" },
+            3
+          );
+        });
+        const experimentId = loadActiveExperiment()!.experiment_id;
+
+        await act(async () => {
+          await result.current.revealBatch();
+        });
+        expect(result.current.rollCount).toBe(6);
+
+        // reload: 新しいCoreセッション・新しいhookインスタンスとして「続きから」を選ぶ。
+        mocks.appendDrawFailOnCallNumber = null; // 新しいsessionでは書き込みは正常に成功する
+        const fakeAfterReload = createFakeCoreSession(null, "pthumeru_depth5_standard_watchers_v0_1");
+        mocks.sessionFactory = () => fakeAfterReload;
+        const { result: resultAfterReload } = renderHook(() => useResearchSession());
+
+        await act(async () => {
+          await resultAfterReload.current.resumeExperiment();
+        });
+        expect(resultAfterReload.current.rollCount).toBe(6);
+
+        await act(async () => {
+          await resultAfterReload.current.revealBatch();
+        });
+        const rows = await listDrawsForExperiment(experimentId);
+        expect(rows.map((r) => r.draw_index)).toEqual([1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]);
+        // 7件目は欠番にならず、resume後の最初の保存成功drawとして連番のまま7になる。
+        expect(rows.find((r) => r.draw_index === 7)).toBeDefined();
+      },
+      15000
+    );
+  });
 });

@@ -338,6 +338,18 @@ test("legacy payloadでもexperiment_idが無ければ従来どおり失敗す�
   assert.equal(result.error, "experiment_id_required");
 });
 
+test("request_typeが'experiment'/'research_draws_chunk'以外の未知の文字列なら、legacyとして保存せずunknown_request_typeで拒否する", () => {
+  const env = loadCodeGs();
+  env.setSheet("Experiments", makeExperimentsSheet());
+
+  const result = callDoPost(env, { request_type: "some_typo", experiment_id: "exp-1" });
+
+  assert.equal(result.ok, false);
+  assert.equal(result.error, "unknown_request_type");
+  // legacyとして誤って保存されていない(Experimentsシートにデータ行が増えていない)。
+  assert.equal(env.sheetsByName["Experiments"]._grid.length, 1);
+});
+
 // ---- doPost: request_type="research_draws_chunk"(指示3節E) ----
 
 test("body.experiment_idと一致しないdrawが1件でもあれば、chunk全体を失敗させ書き込まない", () => {

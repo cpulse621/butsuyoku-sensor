@@ -90,7 +90,7 @@ describe("services/researchSubmission", () => {
   it("endpoint設定済みなら、text/plainヘッダでJSON文字列をPOSTする", async () => {
     vi.stubEnv("VITE_RESEARCH_ENDPOINT", "https://example.com/exec");
     const { submitExperiment } = await import("./researchSubmission");
-    const fetchSpy = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+    const fetchSpy = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ ok: true, duplicate: false, experiment_id: "exp-1", row: 5 }) });
     vi.stubGlobal("fetch", fetchSpy);
 
     const experiment = makeExperiment();
@@ -113,7 +113,7 @@ describe("services/researchSubmission", () => {
   it("送信するJSONはtargetをフラット化したトップレベルキーを持つ(ネストされたtargetオブジェクトは送らない)", async () => {
     vi.stubEnv("VITE_RESEARCH_ENDPOINT", "https://example.com/exec");
     const { submitExperiment } = await import("./researchSubmission");
-    const fetchSpy = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+    const fetchSpy = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ ok: true, duplicate: false, experiment_id: "exp-1", row: 5 }) });
     vi.stubGlobal("fetch", fetchSpy);
 
     const experiment = makeExperiment({
@@ -180,7 +180,7 @@ describe("services/researchSubmission", () => {
   it("attemptSubmissionは送信結果をresearchHistoryのsubmission_statusへ反映する", async () => {
     vi.stubEnv("VITE_RESEARCH_ENDPOINT", "https://example.com/exec");
     const { attemptSubmission } = await import("./researchSubmission");
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, status: 200 }));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ ok: true, duplicate: false }) }));
 
     const experiment = makeExperiment({ experiment_id: "e-attempt" });
     addExperiment(experiment);
@@ -194,7 +194,7 @@ describe("services/researchSubmission", () => {
   it("retryAllPendingSubmissionsはpending/failedのみ再送し、sent済みは触らない", async () => {
     vi.stubEnv("VITE_RESEARCH_ENDPOINT", "https://example.com/exec");
     const { retryAllPendingSubmissions } = await import("./researchSubmission");
-    const fetchSpy = vi.fn().mockResolvedValue({ ok: true, status: 200 });
+    const fetchSpy = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ ok: true, duplicate: false }) });
     vi.stubGlobal("fetch", fetchSpy);
 
     addExperiment(makeExperiment({ experiment_id: "e-pending", submission_status: "pending" }));
@@ -212,7 +212,7 @@ describe("services/researchSubmission", () => {
   it("同一experiment_idを再送しても、ローカル側で行が増えたりはしない(重複防止はApps Script側の責務)", async () => {
     vi.stubEnv("VITE_RESEARCH_ENDPOINT", "https://example.com/exec");
     const { attemptSubmission } = await import("./researchSubmission");
-    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, status: 200 }));
+    vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ ok: true, duplicate: true }) }));
 
     const experiment = makeExperiment({ experiment_id: "e-dup" });
     addExperiment(experiment);
@@ -220,5 +220,115 @@ describe("services/researchSubmission", () => {
     await attemptSubmission(experiment);
 
     expect(listExperiments()).toHaveLength(1); // ローカル側は常に1件のまま
+  });
+
+  describe("Apps Scriptのレスポンス本文のack検証(HTTP 200でもok:falseならfailed扱いにする)", () => {
+    it("HTTP200 + {ok:true, duplicate:false} → sent", async () => {
+      vi.stubEnv("VITE_RESEARCH_ENDPOINT", "https://example.com/exec");
+      const { submitExperiment } = await import("./researchSubmission");
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ ok: true, duplicate: false, experiment_id: "exp-1", row: 3 }) }));
+
+      const outcome = await submitExperiment(makeExperiment());
+      expect(outcome).toEqual({ status: "sent" });
+    });
+
+    it("HTTP200 + {ok:true, duplicate:true} → sent(既存experiment_idの再送は失敗ではない)", async () => {
+      vi.stubEnv("VITE_RESEARCH_ENDPOINT", "https://example.com/exec");
+      const { submitExperiment } = await import("./researchSubmission");
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ ok: true, duplicate: true, experiment_id: "exp-1" }) }));
+
+      const outcome = await submitExperiment(makeExperiment());
+      expect(outcome).toEqual({ status: "sent" });
+    });
+
+    it("HTTP200 + {ok:false, error:\"experiment_validation_failed\"} → failedとして扱い、エラー文字列を残す", async () => {
+      vi.stubEnv("VITE_RESEARCH_ENDPOINT", "https://example.com/exec");
+      const { submitExperiment } = await import("./researchSubmission");
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue({
+          ok: true,
+          status: 200,
+          json: async () => ({ ok: false, error: "experiment_validation_failed", missing_fields: ["coin_used"] }),
+        })
+      );
+
+      const outcome = await submitExperiment(makeExperiment());
+      expect(outcome.status).toBe("failed");
+      expect(outcome).toMatchObject({ error: "experiment_validation_failed" });
+    });
+
+    it("HTTP200 + server_busy等のApps Scriptエラー応答もfailedとして扱う", async () => {
+      vi.stubEnv("VITE_RESEARCH_ENDPOINT", "https://example.com/exec");
+      const { submitExperiment } = await import("./researchSubmission");
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ ok: false, error: "server_busy" }) }));
+
+      const outcome = await submitExperiment(makeExperiment());
+      expect(outcome.status).toBe("failed");
+      expect(outcome).toMatchObject({ error: "server_busy" });
+    });
+
+    it("HTTP200だがJSON本文がnullならfailedとして扱う", async () => {
+      vi.stubEnv("VITE_RESEARCH_ENDPOINT", "https://example.com/exec");
+      const { submitExperiment } = await import("./researchSubmission");
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => null }));
+
+      const outcome = await submitExperiment(makeExperiment());
+      expect(outcome.status).toBe("failed");
+    });
+
+    it("HTTP200だがJSONとして解釈できない(res.jsonが例外を投げる)場合もfailedとして扱う", async () => {
+      vi.stubEnv("VITE_RESEARCH_ENDPOINT", "https://example.com/exec");
+      const { submitExperiment } = await import("./researchSubmission");
+      vi.stubGlobal(
+        "fetch",
+        vi.fn().mockResolvedValue({
+          ok: true,
+          status: 200,
+          json: async () => {
+            throw new Error("not valid JSON");
+          },
+        })
+      );
+
+      const outcome = await submitExperiment(makeExperiment());
+      expect(outcome.status).toBe("failed");
+    });
+
+    it("HTTP200だがJSON形状が不正(okがboolean以外)ならfailedとして扱う", async () => {
+      vi.stubEnv("VITE_RESEARCH_ENDPOINT", "https://example.com/exec");
+      const { submitExperiment } = await import("./researchSubmission");
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ ok: "yes" }) }));
+
+      const outcome = await submitExperiment(makeExperiment());
+      expect(outcome.status).toBe("failed");
+    });
+
+    it("HTTP自体の失敗(transport failure)は引き続きfailedとして扱う(既存挙動の維持)", async () => {
+      vi.stubEnv("VITE_RESEARCH_ENDPOINT", "https://example.com/exec");
+      const { submitExperiment } = await import("./researchSubmission");
+      vi.stubGlobal("fetch", vi.fn().mockResolvedValue({ ok: false, status: 500 }));
+
+      const outcome = await submitExperiment(makeExperiment());
+      expect(outcome.status).toBe("failed");
+    });
+
+    it("failedになった送信は、retryAllPendingSubmissionsで後から再送できる(既存仕様の維持)", async () => {
+      vi.stubEnv("VITE_RESEARCH_ENDPOINT", "https://example.com/exec");
+      const { attemptSubmission, retryAllPendingSubmissions } = await import("./researchSubmission");
+      const fetchSpy = vi.fn();
+      // 1回目: server-side validation失敗を模す。2回目(再送): 成功する。
+      fetchSpy.mockResolvedValueOnce({ ok: true, status: 200, json: async () => ({ ok: false, error: "experiment_validation_failed" }) });
+      fetchSpy.mockResolvedValue({ ok: true, status: 200, json: async () => ({ ok: true, duplicate: false }) });
+      vi.stubGlobal("fetch", fetchSpy);
+
+      const experiment = makeExperiment({ experiment_id: "e-retry-after-ack-failure" });
+      addExperiment(experiment);
+      await attemptSubmission(experiment);
+      expect(listExperiments().find((e) => e.experiment_id === "e-retry-after-ack-failure")?.submission_status).toBe("failed");
+
+      await retryAllPendingSubmissions();
+      expect(listExperiments().find((e) => e.experiment_id === "e-retry-after-ack-failure")?.submission_status).toBe("sent");
+    });
   });
 });

@@ -196,6 +196,15 @@ function doPost(e) {
       return json_(handleExperiment_(payload));
     }
 
+    if (requestType !== undefined) {
+      // request_typeが指定されているが"experiment"/"research_draws_chunk"のいずれでもない
+      // (タイポ・将来のクライアントバグ等)。legacyとして誤って保存しないよう明示的に拒否する。
+      return json_({
+        ok: false,
+        error: 'unknown_request_type',
+      });
+    }
+
     // request_typeが無いlegacy POSTには上記の厳格validationを適用しない(指示3節D項。
     // 既存pilot dataのクライアントを壊さないため)。experiment_id必須チェックのみ
     // handleExperiment_内の既存ロジックに委ねる。
