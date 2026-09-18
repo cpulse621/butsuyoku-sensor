@@ -1,7 +1,70 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { appendDraw, DRAW_DETAIL_SCHEMA_VERSION } from "../storage/researchDrawsDb";
 import type { ResearchDrawRecord } from "../storage/researchDrawsDb";
-import { getResearchDrawsSyncStatus } from "../storage/researchDrawsSyncStatus";
+import { getResearchDrawsSyncStatus, saveResearchDrawsSyncStatus } from "../storage/researchDrawsSyncStatus";
+import { addExperiment } from "../storage/researchHistory";
+import type { ResearchExperiment } from "../storage/researchHistory";
+
+function makeExperiment(overrides: Partial<ResearchExperiment> = {}): ResearchExperiment {
+  return {
+    experiment_id: "exp-1",
+    participant_id: "participant-1",
+    started_at: "2026-01-01T00:00:00.000Z",
+    finished_at: "2026-01-01T00:01:00.000Z",
+    duration_ms: 60000,
+    dataset_id: "pthumeru_depth5_standard_watchers_v0_1",
+    enemy_id: "merciless_watchers",
+    enemy_display_name: "3デブ",
+    target: {
+      shape: ["radial"],
+      primary_effect_id: "physical",
+      primary_allowed_ranks: [17, 18, 19],
+      secondary_effect_id: null,
+      secondary_allowed_ranks: null,
+      accepted_curse_ids: ["stamina_cost_up"],
+    },
+    target_label_snapshot: {
+      primary_label: "物理攻撃力UP",
+      primary_allowed_values: "25.3;26.3;27.2",
+      secondary_label: "",
+      secondary_allowed_values: "",
+      accepted_curse_labels: "スタミナ消費増加",
+    },
+    desire_score: 5,
+    success: true,
+    censored: false,
+    roll_count: 1,
+    cutoff_draws: null,
+    batch_count: 1,
+    draw_advance_mode: "manual",
+    auto_interval_ms: null,
+    pause_count: 0,
+    paused_duration_ms: 0,
+    theoretical_probability: 0.1258,
+    expected_draws: 7.95,
+    tedious_score: 3,
+    real_game_burden_score: 4,
+    sensor_score: 5,
+    effort_reward_fit_score: 4,
+    perceived_expected_draws: 20,
+    exit_reason: null,
+    termination_reason: "target_match",
+    engine_version: "motsuyoku-sensor-core@0.1.0",
+    data_version: "v0.12-watchers",
+    app_version: "0.2.0",
+    research_protocol_version: "v3-coin",
+    reveal_mode: "sequential",
+    reveal_interval_ms: 400,
+    active_duration_ms: 55000,
+    resume_count: 0,
+    draw_detail_count: 1,
+    coin_initial: 100000,
+    coin_remaining: 99900,
+    coin_used: 100,
+    submission_status: "sent",
+    ...overrides,
+  };
+}
 
 function makeDraw(overrides: Partial<ResearchDrawRecord> = {}): ResearchDrawRecord {
   return {
@@ -210,6 +273,74 @@ describe("services/researchDrawsSubmission", () => {
       const status = getResearchDrawsSyncStatus("exp-inconsistent");
       expect(status?.state).toBe("failed");
       expect(status?.synced_through_draw_index).toBe(0);
+    });
+  });
+
+  describe("retryAllUnsyncedResearchDraws: Experimentsのsubmission_statusから完全に独立した再送(指示2節)", () => {
+    it("Experimentがsent済みでもResearchDrawsが未完了(failed)なら再送する", async () => {
+      vi.stubEnv("VITE_RESEARCH_ENDPOINT", "https://example.com/exec");
+      addExperiment(makeExperiment({ experiment_id: "exp-sent-draws-failed", submission_status: "sent" }));
+      await appendDraw(makeDraw({ experiment_id: "exp-sent-draws-failed", draw_index: 1 }));
+      saveResearchDrawsSyncStatus({
+        experiment_id: "exp-sent-draws-failed",
+        state: "failed",
+        synced_through_draw_index: 0,
+        last_error: "HTTP 500",
+        updated_at: "2026-01-01T00:00:00.000Z",
+      });
+      const { retryAllUnsyncedResearchDraws } = await import("./researchDrawsSubmission");
+      const fetchSpy = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ ok: true, received: 1, inserted: 1, duplicates: 0 }) });
+      vi.stubGlobal("fetch", fetchSpy);
+
+      await retryAllUnsyncedResearchDraws();
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+      expect(getResearchDrawsSyncStatus("exp-sent-draws-failed")?.state).toBe("synced");
+    });
+
+    it("ResearchDrawsが未着手(sync statusが存在しない)のexperiment_idも再送対象になる", async () => {
+      vi.stubEnv("VITE_RESEARCH_ENDPOINT", "https://example.com/exec");
+      addExperiment(makeExperiment({ experiment_id: "exp-never-attempted", submission_status: "sent" }));
+      await appendDraw(makeDraw({ experiment_id: "exp-never-attempted", draw_index: 1 }));
+      const { retryAllUnsyncedResearchDraws } = await import("./researchDrawsSubmission");
+      const fetchSpy = vi.fn().mockResolvedValue({ ok: true, status: 200, json: async () => ({ ok: true, received: 1, inserted: 1, duplicates: 0 }) });
+      vi.stubGlobal("fetch", fetchSpy);
+
+      await retryAllUnsyncedResearchDraws();
+
+      expect(fetchSpy).toHaveBeenCalledTimes(1);
+    });
+
+    it("synced済みのexperiment_idはネットワークアクセスせずskipする", async () => {
+      vi.stubEnv("VITE_RESEARCH_ENDPOINT", "https://example.com/exec");
+      addExperiment(makeExperiment({ experiment_id: "exp-already-synced", submission_status: "sent" }));
+      await appendDraw(makeDraw({ experiment_id: "exp-already-synced", draw_index: 1 }));
+      saveResearchDrawsSyncStatus({
+        experiment_id: "exp-already-synced",
+        state: "synced",
+        synced_through_draw_index: 1,
+        last_error: null,
+        updated_at: "2026-01-01T00:00:00.000Z",
+      });
+      const { retryAllUnsyncedResearchDraws } = await import("./researchDrawsSubmission");
+      const fetchSpy = vi.fn();
+      vi.stubGlobal("fetch", fetchSpy);
+
+      await retryAllUnsyncedResearchDraws();
+
+      expect(fetchSpy).not.toHaveBeenCalled();
+    });
+
+    it("endpoint未設定ならネットワークアクセスせずに何もしない", async () => {
+      addExperiment(makeExperiment({ experiment_id: "exp-no-endpoint" }));
+      await appendDraw(makeDraw({ experiment_id: "exp-no-endpoint", draw_index: 1 }));
+      const { retryAllUnsyncedResearchDraws } = await import("./researchDrawsSubmission");
+      const fetchSpy = vi.fn();
+      vi.stubGlobal("fetch", fetchSpy);
+
+      await retryAllUnsyncedResearchDraws();
+
+      expect(fetchSpy).not.toHaveBeenCalled();
     });
   });
 });

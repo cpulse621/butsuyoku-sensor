@@ -1,6 +1,6 @@
 {
   "name": "motsuyoku-sensor-web",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "type": "module",
   "description": "物欲センサー検証アプリ - シミュレーターモードWeb UI (React + TypeScript)。ロジックはmotsuyoku-sensor-core(JS ESM)に委譲する。",

@@ -86,6 +86,50 @@ const CDF_ROLL_COUNT_FIELD = 'roll_count'; // success_cdf_at_rollのRC[-5]
 const SURVIVAL_BOOLEAN_FIELD = 'censored'; // survival_probability_at_cutoffのRC[-7]
 const SURVIVAL_CUTOFF_FIELD = 'cutoff_draws'; // survival_probability_at_cutoffのRC[-5]
 
+// v3 envelope(request_type: "experiment")のみに適用する必須key一覧。
+// これらのkeyが「存在すること」を検証する(値がnullであることは許容する。指示3節A項)。
+// request_typeが無いlegacy POSTにはこの厳格validationを適用しない(後方互換。3節D項)。
+const EXPERIMENT_REQUIRED_KEYS = [
+  'experiment_id',
+  'participant_id',
+  'started_at',
+  'finished_at',
+  'duration_ms',
+  'dataset_id',
+  'enemy_id',
+  'shape',
+  'primary_effect_id',
+  'desire_score',
+  'draw_advance_mode',
+  'success',
+  'censored',
+  'roll_count',
+  'cutoff_draws',
+  'batch_count',
+  'theoretical_probability',
+  'tedious_score',
+  'real_game_burden_score',
+  'sensor_score',
+  'effort_reward_fit_score',
+  'perceived_expected_draws',
+  'termination_reason',
+  'engine_version',
+  'data_version',
+  'app_version',
+  'research_protocol_version',
+  'reveal_mode',
+  'reveal_interval_ms',
+  'active_duration_ms',
+  'resume_count',
+  'draw_detail_count',
+  'coin_initial',
+  'coin_used',
+  'coin_remaining',
+];
+
+// ResearchDraws chunkの1リクエストあたりの上限(docs/apps_script_v3_spec.md 3節: 通常250 / 上限500)。
+const MAX_RESEARCH_DRAWS_CHUNK_SIZE = 500;
+
 // ---- エントリポイント ----
 
 function doGet() {
@@ -134,12 +178,28 @@ function doPost(e) {
       return json_(handleResearchDrawsChunk_(body));
     }
 
-    const payload =
-      requestType === 'experiment' && body.payload && typeof body.payload === 'object'
-        ? body.payload
-        : body;
+    if (requestType === 'experiment') {
+      // 新v3 envelopeのみ、書き込み前に必須keyの存在を厳格にvalidationする(指示3節A・B項)。
+      // 1件でも欠落していればSheetへ1セルも書き込まず、欠落key名を返す
+      // (experiment_idさえあれば他が空欄でもsent扱いにしていた不具合の修正)。
+      const payload = body.payload && typeof body.payload === 'object' ? body.payload : body;
+      const missingFields = EXPERIMENT_REQUIRED_KEYS.filter(function (key) {
+        return !payload || typeof payload !== 'object' || !Object.prototype.hasOwnProperty.call(payload, key);
+      });
+      if (missingFields.length > 0) {
+        return json_({
+          ok: false,
+          error: 'experiment_validation_failed',
+          missing_fields: missingFields,
+        });
+      }
+      return json_(handleExperiment_(payload));
+    }
 
-    return json_(handleExperiment_(payload));
+    // request_typeが無いlegacy POSTには上記の厳格validationを適用しない(指示3節D項。
+    // 既存pilot dataのクライアントを壊さないため)。experiment_id必須チェックのみ
+    // handleExperiment_内の既存ロジックに委ねる。
+    return json_(handleExperiment_(body));
   } catch (error) {
     return json_({
       ok: false,
@@ -336,11 +396,26 @@ function handleResearchDrawsChunk_(body) {
     };
   }
 
+  // 指示3節E項: chunk sizeは最大500(docs/apps_script_v3_spec.md 3節)。
+  if (draws.length > MAX_RESEARCH_DRAWS_CHUNK_SIZE) {
+    return {
+      ok: false,
+      error: 'chunk_too_large',
+      received: draws.length,
+      inserted: 0,
+      duplicates: 0,
+    };
+  }
+
   // 4節: 書き込み前に全rowをvalidationする。1件でも不正ならchunk全体を失敗させ、
   // setValuesを一切実行しない(部分書き込みをしない。クライアントが同じchunkを安全に再送できる)。
+  // 指示3節E項: body.experiment_idと各draw.experiment_idの不一致も、他のmalformed rowと
+  // 同様にchunk全体の失敗として扱う(誤った実験へのデータ混入を防ぐ)。
   const invalid = [];
   draws.forEach((draw, index) => {
-    const error = validateResearchDrawRow_(draw);
+    const error =
+      validateResearchDrawRow_(draw) ||
+      (draw && draw.experiment_id !== experimentId ? 'experiment_id does not match request body.experiment_id' : null);
     if (error) invalid.push({ index: index, draw_index: draw && draw.draw_index, error: error });
   });
   if (invalid.length > 0) {
@@ -411,7 +486,8 @@ function handleResearchDrawsChunk_(body) {
 function validateResearchDrawRow_(draw) {
   if (!draw || typeof draw !== 'object') return 'row is not an object';
   if (typeof draw.experiment_id !== 'string' || draw.experiment_id.length === 0) return 'experiment_id missing';
-  if (typeof draw.draw_index !== 'number') return 'draw_index must be a number';
+  if (typeof draw.draw_index !== 'number' || !Number.isInteger(draw.draw_index) || draw.draw_index <= 0)
+    return 'draw_index must be a positive integer';
   if (typeof draw.batch_index !== 'number') return 'batch_index must be a number';
   if (typeof draw.active_elapsed_ms !== 'number') return 'active_elapsed_ms must be a number';
   if (typeof draw.wall_elapsed_ms !== 'number') return 'wall_elapsed_ms must be a number';

@@ -4,20 +4,55 @@
 
 ## 今のステータス
 
-研究モード・シミュレーターモードとも実装済みで稼働中(GitHub Pages continuous deploy)。研究プロトコルは`research_protocol_version = "v3-coin"`まで完了しており、以下がすべてproductionへ配線済み:
+研究モード・シミュレーターモードとも実装済みで稼働中(GitHub Pages continuous deploy)。研究プロトコルは`research_protocol_version = "v3-coin"`のまま(本収集開始前の今回の修正はいずれも研究条件自体の変更ではないため、versionは変更していない)。`app_version`は`0.1.0`→`0.2.0`へ更新済み(下記「本収集開始前の最終データ完全性修正」節参照。今回の修正の前後を区別する目印)。以下がすべてproductionへ配線済み:
 
 - Q1〜Q5事後アンケート(Q4 effort/reward fit、Q5 perceived rarity。1-2-5系列16段階＋「わからない」)
-- resume(reload復旧)。roll_count/batch_count/一時停止回数/coin残高がResearchDraws(IndexedDB)を正本として復元され、0に戻らない
+- resume(reload復旧)。roll_count/batch_count/一時停止回数/coin残高がResearchDraws(IndexedDB)を正本として復元され、0に戻らない。**2026-09-18: IndexedDBの書き込みawait化・localStorageへのcheckpoint fallback追加により、実機で確認された「reload後に0へ戻る」不具合を修正済み**(詳細は後述)
 - Target表示情報(label/allowed_values)は実験開始時点(TargetがLOCKされる瞬間)のsnapshotとして固定し、以後(送信時含め)再計算しない
 - ResearchDraws(IndexedDB、1 visible draw = 1 record): canonical BloodGem raw field + 確率監査用(`gem_probability_exact`/`gem_surprisal_bits`) + コイン(`coin_cost`/`coin_remaining_after_draw`/`coin_cost_model_version`)をすべて実値で記録
 - コインシステム: `coin_cost = max(1, round(100 × I(g)/H(dataset)))`、`initial_coin = 100,000`。試行回数・残りコイン・使用コインを研究中常時表示。coin<=0かつTarget未達なら`termination_reason="coin_exhausted"`として事後アンケート後に直接finalize(退出理由は挟まない。participant_giveupとは区別)。同一drawでTarget Matchと同時発生した場合はTarget Matchを優先
 - `researchEligible`: `expected_draws <= 1,000`を研究モードのTarget選択UIにのみ適用(`app/web/src/lib/researchEligibility.ts`)。DrawEngineの分布・Simulator modeには影響しない
 
-DrawEngine/ProbabilityEngine(app/core)自体はこの一連の作業を通じて一切変更していない(Fidelity Contract・確率モデルは不変)。テスト: Core 44/44(`node --test`。ワークスペースの`npm test`スクリプトはNode 24環境で`node --test test/`の解釈が変わり動かないことがあるが、コード自体の問題ではない)、Web 109/109、TypeScript・productionビルドともに成功、ブラウザ実機確認済み(3draw・Target Match・survey・finalize・IndexedDB上のcoin_cost等の実値まで確認)。
+DrawEngine/ProbabilityEngine(app/core)自体はこの一連の作業を通じて一切変更していない(Fidelity Contract・確率モデルは不変)。テスト: Core 44/44(`node --test`。ワークスペースの`npm test`スクリプトはNode 24環境で`node --test test/`の解釈が変わり動かないことがあるが、コード自体の問題ではない)、Web 124/124、TypeScript・productionビルドともに成功。加えて`apps_script/Code.test.js`(Node組み込み`node:test`。GASグローバルをスタブ化したサンドボックス実行、`node --test apps_script/Code.test.js`)16/16。
 
-クライアント側のResearchDraws送信処理も実装済み: `services/researchDrawsSubmission.ts`が250件/chunkで`request_type: "research_draws_chunk"`のenvelopeを送信し、`finalize()`・`resendFinalRecord()`・`ResearchHistoryPanel`の再送・`App.tsx`起動時のpending/failed再送ヒューリスティックに配線済み。`services/researchSubmission.ts`もExperimentsを`request_type: "experiment"`のenvelopeで送るよう変更済み(旧`request_type`無しPOSTとの後方互換はApps Script側で担保する前提)。
+クライアント側のResearchDraws送信処理も実装済み: `services/researchDrawsSubmission.ts`が250件/chunkで`request_type: "research_draws_chunk"`のenvelopeを送信し、`finalize()`・`resendFinalRecord()`・`ResearchHistoryPanel`の再送に配線済み。`services/researchSubmission.ts`もExperimentsを`request_type: "experiment"`のenvelopeで送るよう変更済み(旧`request_type`無しPOSTとの後方互換はApps Script側で担保する前提)。**2026-09-18: 起動時/オンライン復帰時の自動再送は、ExperimentsとResearchDrawsを完全に独立させた(`services/retryUnsentData.ts`)**。詳細は後述。
 
 **ResearchDraws送信進捗の永続化(2026-09-18追加)**: `services/researchDrawsSubmission.ts`はApps Scriptのレスポンスが`received === inserted + duplicates`を満たした場合のみそのchunkを成功として扱い、`storage/researchDrawsSyncStatus.ts`(localStorage、キー`butsuyoku_sensor_research_draws_sync_v1`)へexperiment_id単位で「どのdraw_indexまでack済みか」を永続化する。これはExperiments側の`submission_status`ともSheets側の`draw_detail_status`(永続フィールドとして持たない設計のまま)とも独立したブラウザ内だけの状態であり、途中chunkの失敗やタブを閉じた後の再起動を跨いでも、次回`syncResearchDrawsForExperiment`呼び出し時に未ack分のchunkだけを送り直す。HTTPが200でも上記等式が崩れていれば失敗として扱い進捗を進めない。dedupeの正本(`experiment_id + draw_index`)は引き続きサーバー側にあるため、万一ローカルの進捗がサーバーの実態とズレても安全に吸収される。
+
+## 本収集開始前の最終データ完全性修正(2026-09-18)
+
+実機テストと本番Sheetの確認で見つかった3系統の不具合を、本収集開始前に修正した。研究条件(確率モデル・DrawEngine・TargetMatcher)は一切変更していない。
+
+### A. reload/resumeで試行回数が0へ戻る問題
+
+**原因**: (1) `ResearchDraws`(IndexedDB)へのappendDraw()がfire-and-forgetで、書き込み完了を待たずに次のdrawへ進んでいた。(2) `ActiveExperimentSnapshot`(localStorage)にroll_count等のcheckpointを保存しておらず、IndexedDBの読み取りに失敗した場合に無条件で0からの再開になっていた。
+
+**修正**(`app/web/src/hooks/useResearchSession.ts`):
+- `revealBatch()`内のappendDraw()を`await`するようにし、書き込み成功が確認できたdrawについてのみUI状態(roll_count/currentBatchRevealed)とcheckpointを進める。書き込みに失敗したdrawは参加者へ見せず、その回以降のcheckpoint更新も行わない(欠番はAnalysis時にdraw_detail_countとの突き合わせで検知できる)。
+- `ActiveExperimentSnapshot`に`checkpoint_draw_index`/`checkpoint_batch_index`/`checkpoint_active_elapsed_ms`/`checkpoint_coin_remaining`を追加(`app/web/src/storage/researchHistory.ts`)。これはあくまでIndexedDB read失敗時のfallbackであり、ResearchDrawsを正本とする既存方針は変えていない。
+- resume時の優先順位を`buildResumeOffsets()`として明文化: (1) IndexedDBのlastDrawが読めればそれを正本とする(読めて0件だった場合も「0件」として正しく扱う)。(2) IndexedDBの**読み取り自体が失敗した場合のみ**、localStorageのcheckpointへfallbackする。(3) どちらも無ければ0。
+- appendDraw失敗時はUIへ保存失敗を表示する(`researchDrawsSaveError`。`ResearchRunningLayout`・`ResearchView`に配線)。
+
+### B. ResearchDrawsの完全自動再送
+
+**原因**: 起動時の自動再送が、Experiments側の`submission_status`が`pending`/`failed`のexperiment_idだけを対象にResearchDrawsも再送する、という間接的なヒューリスティックだった。Experiment=sent・ResearchDraws=failedの組み合わせでは、ResearchDrawsだけが自動再送から漏れる可能性があった。
+
+**修正**:
+- `services/researchDrawsSubmission.ts`に`retryAllUnsyncedResearchDraws()`を追加。ローカルに存在する全experiment_idについて、`researchDrawsSyncStatus`が`"synced"`でなければ(未着手・in_progress・failedのいずれでも)独立して再送する。Experiments側の状態は一切参照しない。synced済みはネットワークアクセスなしでskipする。
+- `services/retryUnsentData.ts`(新規)を起動時・`window`の`'online'`イベント両方から呼ぶよう`App.tsx`を配線。offline中(`navigator.onLine === false`)は無理に送信せず、何もしない(local-firstで保持。次のonlineイベントで改めて再送される)。
+- `ResearchHistoryPanel`の「未送信データを再送」ボタンは非常用fallbackとしてそのまま残っている(通常運用では押す必要が無い設計になった)。
+- server側dedupe(Experiment: `experiment_id`、ResearchDraws: `experiment_id + draw_index`)は変更していない。
+
+### C. Apps Scriptで不完全Experimentを成功扱いしない
+
+**原因**: 旧`Code.gs`は`experiment_id`さえあれば他のfieldが欠落していても空欄のまま`sent`扱いで書き込んでいた。本番Sheetで`experiment_id`/`submission_status`/`submitted_at`のみが埋まった不完全な行が複数発生していた。
+
+**修正**(`apps_script/Code.gs`。**まだ実際のApps Scriptへは反映していない**):
+- `request_type: "experiment"`のv3 envelopeのみ、`EXPERIMENT_REQUIRED_KEYS`(34key)の存在を書き込み前に検証する。keyの欠落とnull値は区別する(nullable fieldはnullでよい)。1つでも欠落していればSheetへ1セルも書き込まず、`{ok:false, error:"experiment_validation_failed", missing_fields:[...]}`を返す。
+- `request_type`が無いlegacy POST(既存pilot dataの旧クライアント)にはこの厳格validationを適用しない(後方互換)。
+- ResearchDraws側にも、chunk size上限(500)超過での拒否・`body.experiment_id`と各`draw.experiment_id`の不一致検出(不一致ならchunk全体失敗)・`draw_index`が正の整数であることの検証を追加した。
+- **既存Sheetsの行(不完全な空行を含む)は一切変更・削除・backfillしていない**。今回の分の不完全な行はpilot/incompleteなデータとしてそのまま残る。分析時にはこれらを区別すること(`submission_status='sent'`だが主要フィールドが空、という行が該当する)。
+- 検証は`apps_script/Code.test.js`(Node組み込み`node:test`)で行っている。詳細は`docs/apps_script_v3_spec.md`9節・`apps_script/README.md`参照。
 
 ## 次にやること(このセッションでは着手していない)
 
@@ -83,3 +118,5 @@ DrawEngine/ProbabilityEngine(app/core)自体はこの一連の作業を通じて
 - 送信共通処理: `app/web/src/services/appsScriptEndpoint.ts`
 - 送信DTO・Experiments送信: `app/web/src/services/submissionDto.ts` / `app/web/src/services/researchSubmission.ts`
 - ResearchDraws送信: `app/web/src/services/researchDrawsSubmission.ts`
+- 起動時/オンライン復帰時の再送オーケストレーション: `app/web/src/services/retryUnsentData.ts`
+- Apps Scriptのテスト(Node組み込み`node:test`、npm workspaceには含まれない): `apps_script/Code.test.js`

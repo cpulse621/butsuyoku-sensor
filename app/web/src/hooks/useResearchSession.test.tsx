@@ -1,7 +1,7 @@
 import { act, renderHook } from "@testing-library/react";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { BloodGem, ProbabilityResult, ResearchModeRevealResult, ResearchModeSummary, TargetBloodGem } from "motsuyoku-sensor-core";
-import { listExperiments, saveActiveExperiment } from "../storage/researchHistory";
+import { listExperiments, saveActiveExperiment, loadActiveExperiment } from "../storage/researchHistory";
 import { appendDraw, listDrawsForExperiment, DRAW_DETAIL_SCHEMA_VERSION } from "../storage/researchDrawsDb";
 
 // useResearchSessionは「Experiment Flow」自体(roll_countの積算・MATCH停止・survey gating)を
@@ -15,6 +15,11 @@ const mocks = vi.hoisted(() => ({
   // 1000回のrevealNextが必要になり、実タイマー(REVEAL_ITEM_DELAY_MS=400ms)ベースのテストでは
   // 非現実的に遅くなる。coin関連テストだけこの値を小さく差し替える。
   initialCoin: 100000,
+  // appendDraw()を指定回数目(1-indexed)だけ失敗させる(指示1節E項の検証用)。nullなら常に成功する。
+  appendDrawFailOnCallNumber: null as number | null,
+  appendDrawCallCount: 0,
+  // getLastDrawForExperiment()を強制的に失敗させる(指示1節D項: IndexedDB read failureの検証用)。
+  getLastDrawShouldFail: false,
 }));
 
 vi.mock("motsuyoku-sensor-core", async (importOriginal) => {
@@ -31,6 +36,24 @@ vi.mock("../lib/coinCost", async (importOriginal) => {
     ...actual,
     get INITIAL_COIN() {
       return mocks.initialCoin;
+    },
+  };
+});
+
+vi.mock("../storage/researchDrawsDb", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("../storage/researchDrawsDb")>();
+  return {
+    ...actual,
+    appendDraw: async (record: Parameters<typeof actual.appendDraw>[0]) => {
+      mocks.appendDrawCallCount += 1;
+      if (mocks.appendDrawFailOnCallNumber !== null && mocks.appendDrawCallCount === mocks.appendDrawFailOnCallNumber) {
+        throw new Error("indexeddb write failed (test)");
+      }
+      return actual.appendDraw(record);
+    },
+    getLastDrawForExperiment: async (experimentId: string) => {
+      if (mocks.getLastDrawShouldFail) throw new Error("indexeddb read failed (test)");
+      return actual.getLastDrawForExperiment(experimentId);
     },
   };
 });
@@ -171,6 +194,9 @@ describe("hooks/useResearchSession", () => {
     localStorage.clear();
     mocks.sessionFactory = null;
     mocks.initialCoin = 100000;
+    mocks.appendDrawFailOnCallNumber = null;
+    mocks.appendDrawCallCount = 0;
+    mocks.getLastDrawShouldFail = false;
   });
 
   it("startExperimentでrunning状態になり、実験中は理論確率が一切見えない(finalProbability=null)", () => {
@@ -402,7 +428,12 @@ describe("hooks/useResearchSession", () => {
         act(() => {
           revealPromise = result.current.revealBatch();
         });
-        // 開始直後: 1件目だけが表示されている(10件が一度に出ない)
+        // revealBatch()は各drawごとにappendDraw()(IndexedDB書き込み)の完了をawaitするようになった
+        // (指示1節A項: fire-and-forgetにしない)ため、1件目の反映には短い非同期待ちが必要。
+        await act(async () => {
+          await wait(50);
+        });
+        // 1件目だけが表示されている(10件が一度に出ない)
         expect(result.current.currentBatchRevealed).toHaveLength(1);
         expect(result.current.isRevealing).toBe(true);
 
@@ -1091,6 +1122,247 @@ describe("hooks/useResearchSession", () => {
         await result.current.resumeExperiment();
       });
       expect(result.current.coinRemaining).toBe(99568); // 100,000から0からではなく前回の続きから
+    });
+  });
+
+  describe("resume: IndexedDB書き込みawait・checkpoint永続化・保存失敗時の挙動(データ完全性修正)", () => {
+    function makeSnapshot(experimentId: string, overrides: Record<string, unknown> = {}) {
+      return {
+        experiment_id: experimentId,
+        participant_id: "participant-1",
+        started_at: "2026-01-01T00:00:00.000Z",
+        dataset_id: "pthumeru_depth5_standard_watchers_v0_1",
+        enemy_id: "merciless_watchers",
+        enemy_display_name: "3デブ",
+        target: {
+          shape: ["radial"],
+          primary_effect_id: "physical",
+          primary_allowed_ranks: [18],
+          secondary_effect_id: null,
+          secondary_allowed_ranks: null,
+          accepted_curse_ids: ["stamina_cost_up"],
+        },
+        desire_score: 3 as const,
+        draw_advance_mode: "manual" as const,
+        auto_interval_ms: null,
+        pause_count: 0,
+        paused_duration_ms: 0,
+        resume_count: 0,
+        ...overrides,
+      };
+    }
+
+    async function seedDraws(experimentId: string, count: number, batchIndex = 1) {
+      for (let i = 1; i <= count; i++) {
+        // eslint-disable-next-line no-await-in-loop
+        await appendDraw({
+          experiment_id: experimentId,
+          draw_index: i,
+          batch_index: batchIndex,
+          active_elapsed_ms: i * 100,
+          wall_elapsed_ms: i * 100,
+          dataset_id: "pthumeru_depth5_standard_watchers_v0_1",
+          shape_id: "radial",
+          primary_effect_id: "physical",
+          primary_value_rank: 18,
+          secondary_effect_id: null,
+          secondary_value_rank: null,
+          curse_id: "stamina_cost_up",
+          target_match: false,
+          gem_probability_exact: 0.05,
+          gem_surprisal_bits: 4.32,
+          coin_cost: 100,
+          coin_remaining_after_draw: 100000 - i * 100,
+          coin_cost_model_version: COIN_COST_MODEL_VERSION,
+          draw_detail_schema_version: DRAW_DETAIL_SCHEMA_VERSION,
+        });
+      }
+    }
+
+    it("37draw後にreloadしても、resume後は37から再開する(0に戻らない)", async () => {
+      const experimentId = "resume-37-exp";
+      await seedDraws(experimentId, 37, 4); // 4バッチ目(31〜37draw目)の途中で中断された想定
+      saveActiveExperiment(makeSnapshot(experimentId));
+
+      const fake = createFakeCoreSession(null, "pthumeru_depth5_standard_watchers_v0_1");
+      mocks.sessionFactory = () => fake;
+      const { result } = renderHook(() => useResearchSession());
+
+      await act(async () => {
+        await result.current.resumeExperiment();
+      });
+      expect(result.current.rollCount).toBe(37);
+    });
+
+    it("10連の途中(7draw目)でreloadしても、resume後は7から再開し、batch_indexも継続する", async () => {
+      const experimentId = "resume-mid-batch-exp";
+      await seedDraws(experimentId, 7, 1); // 1回目の「次の10連」が7件目で中断された想定
+      saveActiveExperiment(makeSnapshot(experimentId));
+
+      const fake = createFakeCoreSession(null, "pthumeru_depth5_standard_watchers_v0_1");
+      mocks.sessionFactory = () => fake;
+      const { result } = renderHook(() => useResearchSession());
+
+      await act(async () => {
+        await result.current.resumeExperiment();
+      });
+      expect(result.current.rollCount).toBe(7);
+
+      await act(async () => {
+        await result.current.revealBatch();
+      });
+      const rows = await listDrawsForExperiment(experimentId);
+      // resume前の7件+今回の10件=17件。新しいbatch_indexは前回の1から継続して2になる。
+      expect(rows).toHaveLength(17);
+      expect(rows[7].batch_index).toBe(2);
+      expect(rows[16].draw_index).toBe(17);
+    });
+
+    it("ResearchDraws(DB)にlastDrawがあれば、snapshotのcheckpointより優先される", async () => {
+      const experimentId = "resume-db-priority-exp";
+      await seedDraws(experimentId, 5, 1);
+      // snapshot側のcheckpointは(古い/不整合な)別の値にしておく。DBが優先されるべき。
+      saveActiveExperiment(
+        makeSnapshot(experimentId, {
+          checkpoint_draw_index: 999,
+          checkpoint_batch_index: 99,
+          checkpoint_active_elapsed_ms: 999999,
+          checkpoint_coin_remaining: 1,
+        })
+      );
+
+      const fake = createFakeCoreSession(null, "pthumeru_depth5_standard_watchers_v0_1");
+      mocks.sessionFactory = () => fake;
+      const { result } = renderHook(() => useResearchSession());
+
+      await act(async () => {
+        await result.current.resumeExperiment();
+      });
+      expect(result.current.rollCount).toBe(5); // 999ではなくDBの5が使われる
+      expect(result.current.coinRemaining).toBe(100000 - 500); // DBのcoin_remaining_after_drawが使われる
+    });
+
+    it("IndexedDBの読み取りが失敗した場合のみ、snapshotのcheckpointへfallbackする(無言で0扱いにしない)", async () => {
+      const experimentId = "resume-read-failure-exp";
+      // このexperiment_idにはDB上のdrawを一切用意しない。read自体を強制的に失敗させる。
+      mocks.getLastDrawShouldFail = true;
+      saveActiveExperiment(
+        makeSnapshot(experimentId, {
+          checkpoint_draw_index: 15,
+          checkpoint_batch_index: 2,
+          checkpoint_active_elapsed_ms: 6000,
+          checkpoint_coin_remaining: 98500,
+        })
+      );
+
+      const fake = createFakeCoreSession(null, "pthumeru_depth5_standard_watchers_v0_1");
+      mocks.sessionFactory = () => fake;
+      const { result } = renderHook(() => useResearchSession());
+
+      await act(async () => {
+        await result.current.resumeExperiment();
+      });
+      expect(result.current.rollCount).toBe(15); // read失敗時のみsnapshot checkpointへfallback
+      expect(result.current.coinRemaining).toBe(98500);
+    });
+
+    it("IndexedDBの読み取りに成功して0件だった場合は、snapshot checkpointへfallbackせず0から再開する", async () => {
+      const experimentId = "resume-genuinely-empty-exp";
+      // DBのreadは成功するが、まだ1件もdrawが記録されていない(実験開始直後にreloadされた想定)。
+      // このとき、もしsnapshotに何らかのcheckpointが残っていてもfallbackしてはいけない
+      // (readが正常に「0件」と答えているため)。
+      saveActiveExperiment(
+        makeSnapshot(experimentId, {
+          checkpoint_draw_index: 0,
+          checkpoint_batch_index: 0,
+          checkpoint_active_elapsed_ms: 0,
+          checkpoint_coin_remaining: 100000,
+        })
+      );
+
+      const fake = createFakeCoreSession(null, "pthumeru_depth5_standard_watchers_v0_1");
+      mocks.sessionFactory = () => fake;
+      const { result } = renderHook(() => useResearchSession());
+
+      await act(async () => {
+        await result.current.resumeExperiment();
+      });
+      expect(result.current.rollCount).toBe(0);
+    });
+
+    it("resume_countはIndexedDB優先・snapshot fallbackのどちらの経路でも1ずつ正しく増える", async () => {
+      const experimentId = "resume-count-exp";
+      await seedDraws(experimentId, 2, 1);
+      saveActiveExperiment(makeSnapshot(experimentId, { resume_count: 3 }));
+
+      const fake = createFakeCoreSession(1, "pthumeru_depth5_standard_watchers_v0_1");
+      mocks.sessionFactory = () => fake;
+      const { result } = renderHook(() => useResearchSession());
+
+      await act(async () => {
+        await result.current.resumeExperiment();
+      });
+      await act(async () => {
+        await result.current.revealBatch();
+      });
+      await act(async () => {
+        result.current.submitSurvey({ tediousnessScore: 1, painIfRepeatedScore: 1, sensorScore: 1, effortRewardFitScore: 3, perceivedExpectedDraws: 100 });
+        await wait(50);
+      });
+      expect(result.current.finalRecord?.resume_count).toBe(4); // 3 + 1
+    });
+
+    it("appendDraw()の完了を待ってからのみcheckpointを進める(fire-and-forgetにしない)", async () => {
+      // 1回目のappendDraw呼び出しから失敗させる。このdrawはUI・checkpointのどちらにも反映されない。
+      mocks.appendDrawFailOnCallNumber = 1;
+      const fake = createFakeCoreSession(null);
+      mocks.sessionFactory = () => fake;
+      const { result } = renderHook(() => useResearchSession());
+
+      act(() => {
+        result.current.startExperiment(TEST_DATASET, TEST_TARGET, 3);
+      });
+
+      await act(async () => {
+        await result.current.revealBatch();
+      });
+
+      expect(result.current.rollCount).toBe(0); // 保存できなかったdrawはUIにも反映されない
+      expect(result.current.currentBatchRevealed).toHaveLength(0);
+      expect(result.current.researchDrawsSaveError).not.toBeNull(); // 保存失敗がUIへ表示される
+
+      const rows = await listDrawsForExperiment(result.current.finalRecord?.experiment_id ?? "");
+      expect(rows).toHaveLength(0);
+
+      const snapshot = loadActiveExperiment();
+      expect(snapshot?.checkpoint_draw_index ?? 0).toBe(0); // checkpointも進んでいない
+    });
+
+    it("1バッチ内で3件成功後に4件目が失敗した場合、3件目までは確定保存され、4件目以降は保存されない", async () => {
+      mocks.appendDrawFailOnCallNumber = 4;
+      const fake = createFakeCoreSession(null); // MATCHなし(10件全部生成しようとする想定)
+      mocks.sessionFactory = () => fake;
+      const { result } = renderHook(() => useResearchSession());
+
+      act(() => {
+        result.current.startExperiment(TEST_DATASET, TEST_TARGET, 3);
+      });
+      const experimentId = loadActiveExperiment()!.experiment_id;
+
+      await act(async () => {
+        await result.current.revealBatch();
+      });
+
+      expect(result.current.rollCount).toBe(3); // 4件目以降は表示・カウントされない
+      expect(result.current.currentBatchRevealed).toHaveLength(3);
+      expect(result.current.researchDrawsSaveError).not.toBeNull();
+
+      const rows = await listDrawsForExperiment(experimentId);
+      expect(rows).toHaveLength(3); // 4件目は保存されていない(欠番のまま)
+      expect(rows.map((r) => r.draw_index)).toEqual([1, 2, 3]);
+
+      const snapshot = loadActiveExperiment();
+      expect(snapshot?.checkpoint_draw_index).toBe(3); // checkpointも3件目までしか進んでいない
     });
   });
 });

@@ -19,6 +19,7 @@ import type { ResearchDrawRecord } from "../storage/researchDrawsDb";
 import { isEndpointConfigured, postToAppsScript } from "./appsScriptEndpoint";
 import { getResearchDrawsSyncStatus, saveResearchDrawsSyncStatus } from "../storage/researchDrawsSyncStatus";
 import type { ResearchDrawsSyncState } from "../storage/researchDrawsSyncStatus";
+import { listExperiments } from "../storage/researchHistory";
 
 export const RESEARCH_DRAWS_SCHEMA_VERSION = "research-draw-v2";
 // 通常のchunkサイズ(docs/apps_script_v3_spec.md 3節: 通常250 / 上限500)。
@@ -160,4 +161,20 @@ export async function syncResearchDrawsForExperiment(experimentId: string): Prom
   }
 
   return { status: "synced", chunkCount: chunks.length, drawCount: unsent.length };
+}
+
+// 起動時・オンライン復帰時にまとめて呼ぶ、ResearchDraws側の独立した再送(指示2節)。
+// Experimentsのsubmission_statusには一切依存しない: ローカルに存在する全experiment_idについて、
+// このexperiment_idのResearchDraws同期状態がまだ"synced"でなければ(未着手・in_progress・failedの
+// いずれでも)再送を試みる。Experimentがsent済みでもResearchDrawsだけが未完了なら、ここで拾われる。
+// 既にsynced済みのexperiment_idはネットワークアクセスなしでskipする(指示2節E項)。
+export async function retryAllUnsyncedResearchDraws(): Promise<void> {
+  if (!isEndpointConfigured()) return;
+  const experiments = listExperiments();
+  for (const experiment of experiments) {
+    const status = getResearchDrawsSyncStatus(experiment.experiment_id);
+    if (status?.state === "synced") continue;
+    // eslint-disable-next-line no-await-in-loop
+    await syncResearchDrawsForExperiment(experiment.experiment_id);
+  }
 }

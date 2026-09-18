@@ -150,6 +150,16 @@ export interface ActiveExperimentSnapshot {
   pause_count: number;
   paused_duration_ms: number;
   resume_count: number;
+
+  // resume用のfallback checkpoint(正本はあくまでResearchDraws/IndexedDBの最終行)。
+  // appendDraw()がIndexedDBへの書き込み成功をawaitした直後にのみ更新される値であり、
+  // 「IndexedDBの読み取り自体が失敗した場合」だけの保険として使う(指示1節D項)。
+  // このsnapshot導入より前に保存されたactiveExperimentには存在しない可能性があるため、
+  // 読み出し側はoptional前提で扱う(undefinedならfallbackとして使わず、0からの再開とする)。
+  checkpoint_draw_index?: number;
+  checkpoint_batch_index?: number;
+  checkpoint_active_elapsed_ms?: number;
+  checkpoint_coin_remaining?: number;
 }
 
 export interface StorageResult {

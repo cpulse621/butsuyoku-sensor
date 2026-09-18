@@ -3,9 +3,7 @@ import type { GemDataset } from "motsuyoku-sensor-core";
 import { EvilSpiritDataset, MadmanDataset, WatchersDataset } from "motsuyoku-sensor-core";
 import { SimulatorView } from "./SimulatorView";
 import { ResearchView } from "./ResearchView";
-import { retryAllPendingSubmissions } from "./services/researchSubmission";
-import { syncResearchDrawsForExperiment } from "./services/researchDrawsSubmission";
-import { listExperiments } from "./storage/researchHistory";
+import { retryAllUnsentResearchData } from "./services/retryUnsentData";
 
 const DATASETS: GemDataset[] = [WatchersDataset, MadmanDataset, EvilSpiritDataset];
 
@@ -15,20 +13,17 @@ export default function App() {
   const [mode, setMode] = useState<AppMode>("simulator");
   const [dataset, setDataset] = useState<GemDataset>(WatchersDataset);
 
-  // 起動時、送信先が設定されていて未送信(pending/failed)のまま残っている研究データがあれば
-  // 安全に再送を試みる(同一experiment_idの再送・同一chunkの再送はApps Script側のdedupeに委ねる)。
-  // ResearchDrawsは(draw_detail_statusのような永続的な送信状態を持たない設計のため)独立した
-  // 「未送信」判定ができないが、Experiments側がpending/failedのexperiment_idはResearchDrawsも
-  // 未送信である可能性が高いため、同じ対象へまとめて再送を試みておく(ヒューリスティック)。
+  // 起動時、およびオフライン→オンライン復帰時に、未送信のまま残っている研究データを
+  // まとめて再送する(指示2節)。ExperimentsとResearchDrawsは完全に独立した再送経路であり、
+  // 片方がsent/synced済みでももう片方が未完了なら再送される(詳細はretryAllUnsentResearchData参照)。
+  // offline中は無理に送信せず、local-firstで保持する('online'イベントで改めて呼ばれる)。
   useEffect(() => {
-    void retryAllPendingSubmissions();
-    void (async () => {
-      const atRisk = listExperiments().filter((e) => e.submission_status === "pending" || e.submission_status === "failed");
-      for (const experiment of atRisk) {
-        // eslint-disable-next-line no-await-in-loop
-        await syncResearchDrawsForExperiment(experiment.experiment_id);
-      }
-    })();
+    function retry() {
+      void retryAllUnsentResearchData();
+    }
+    retry();
+    window.addEventListener("online", retry);
+    return () => window.removeEventListener("online", retry);
   }, []);
 
   return (

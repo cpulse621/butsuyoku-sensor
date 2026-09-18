@@ -127,6 +127,7 @@ export function ResearchView({ datasets, dataset, onSelectDataset }: Props) {
         isRevealing={session.isRevealing}
         currentBatchRevealed={session.currentBatchRevealed}
         resumedProgressReset={session.resumedProgressReset}
+        researchDrawsSaveError={session.researchDrawsSaveError}
         coinRemaining={session.coinRemaining}
         coinUsed={session.coinUsed}
         onRevealBatch={session.revealBatch}
@@ -152,6 +153,12 @@ export function ResearchView({ datasets, dataset, onSelectDataset }: Props) {
           {session.saveError && (
             <div className="blocker-box">
               <strong>記録できませんでした:</strong> {session.saveError}
+            </div>
+          )}
+
+          {session.researchDrawsSaveError && (
+            <div className="blocker-box" role="alert">
+              {session.researchDrawsSaveError}
             </div>
           )}
 

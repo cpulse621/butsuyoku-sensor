@@ -15,6 +15,7 @@ interface Props {
   isRevealing: boolean;
   currentBatchRevealed: RevealedEntry[];
   resumedProgressReset: boolean;
+  researchDrawsSaveError: string | null;
   coinRemaining: number;
   coinUsed: number;
   onRevealBatch: () => void;
@@ -49,6 +50,7 @@ export function ResearchRunningLayout({
   isRevealing,
   currentBatchRevealed,
   resumedProgressReset,
+  researchDrawsSaveError,
   coinRemaining,
   coinUsed,
   onRevealBatch,
@@ -80,6 +82,12 @@ export function ResearchRunningLayout({
       {resumedProgressReset && (
         <div className="blocker-box research-run-shell__notice">
           前回の実験を再開しました。試行回数・一時停止回数・Target・欲しさ評価・manual/auto条件はすべて引き継がれています。
+        </div>
+      )}
+
+      {researchDrawsSaveError && (
+        <div className="blocker-box research-run-shell__notice" role="alert">
+          {researchDrawsSaveError}
         </div>
       )}
 

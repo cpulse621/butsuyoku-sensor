@@ -17,24 +17,38 @@
 
 両方で問題が無いことを確認できて初めて、この`Code.gs`を反映してください。もし不一致があれば、5定数の値をLoggerの出力に合わせて修正してから再度実行してください。
 
-### 2. その他の確認事項
+### 2. 新規: request_type="experiment"のv3 envelopeに対する厳格validation
+
+本番Sheetで、`experiment_id`/`submission_status`/`submitted_at`だけが埋まり他のフィールドが空欄の不完全な行が複数発生していた問題への対応です。`doPost`は`request_type: "experiment"`のリクエストについてのみ、`EXPERIMENT_REQUIRED_KEYS`(34key。`Code.gs`冒頭で定義)がすべて**存在すること**(値がnullであることは許容する)を書き込み前に検証します。1つでも欠落していれば1セルも書き込まず、`{ok:false, error:"experiment_validation_failed", missing_fields:[...]}`を返します。
+
+**`request_type`が無いlegacy POST(既存pilot dataを送っていた旧クライアント)にはこの厳格validationを適用しません**(後方互換。従来どおり`experiment_id`のみ必須)。
+
+ResearchDraws側にも同様の趣旨で以下を追加しています:
+- chunk sizeの上限500を超えたら`chunk_too_large`で拒否する。
+- `body.experiment_id`と各`draw.experiment_id`が一致しない場合、そのrowを不正として扱いchunk全体を失敗させる(誤った実験へのデータ混入防止)。
+- `draw_index`は正の整数であることを検証する(旧: 数値であることのみ)。
+
+これらは`apps_script/Code.test.js`(Node組み込みの`node:test`。GASグローバルをスタブ化したサンドボックスで実行)でカバーされています。`node --test apps_script/Code.test.js`で実行できます。
+
+### 3. その他の確認事項
 
 - 新規`ResearchDraws`シートを作成する処理を含みますが、実際にデプロイ前に一度テスト用のスプレッドシートで動作確認することを推奨します。
 - Spreadsheetのtimezone変更(`America/Los_Angeles` → `Asia/Tokyo`)は、このスクリプトの範囲外です(Apps Scriptの設定またはスプレッドシートの「ファイル > 設定」から手動で行ってください)。
 - `appsscript.json`(マニフェスト)の変更は不要です。このスクリプトは`SpreadsheetApp` / `LockService` / `ContentService` / `Logger`のみを使っており、いずれも追加のOAuthスコープ宣言やトリガー設定を必要としない標準サービスです。既存プロジェクトに手動編集済みのマニフェストが無い場合、新たに作成する必要もありません。
+- **既存Sheetsの行は一切変更・削除・backfillしません**。今回のvalidation追加は新規POSTにのみ適用され、既に書き込まれている不完全な行(experiment_id/submission_status/submitted_atのみの空行を含む)はそのまま残ります。これらはpilot/incompleteなデータとして扱ってください(`docs/handoff.md`参照)。
 
 ## デプロイ手順(概要)
 
 1. Google Apps Scriptエディタで既存プロジェクトを開く。
 2. 既存`Code.gs`の内容をバックアップ(コピー)してから、この`Code.gs`の内容で置き換える。
 3. 上記「1. success_cdf_at_roll / survival_probability_at_cutoff の参照列」の2関数を実行し、問題が無いことを確認する。
-4. テスト用スプレッドシートで`doPost`の動作を確認する(Experiments・ResearchDrawsの両方。request_type無しの旧形式POSTも壊れていないことを含む)。
+4. テスト用スプレッドシートで`doPost`の動作を確認する(Experiments・ResearchDrawsの両方。request_type無しの旧形式POSTも壊れていないこと、不完全なv3 payloadが拒否されることを含む)。
 5. 問題なければ本番スプレッドシートへ適用し、**新しいデプロイメント**を作成する(コード変更だけではWebアプリURLへ反映されない)。
 
 ## 実物との差分の要点
 
 - Experimentsの既存ロジック(`SPREADSHEET_ID`への`openById`、`experiment_id`によるTextFinder重複検知(重複時は上書きせず`duplicate:true`を返すのみ)、空き行への書き込み、`submission_status`/`submitted_at`の自動設定、`safeValue_`によるformula injection対策、`LockService`)はすべてそのまま維持しています。
-- `doPost`の先頭で`request_type`を見て、`"research_draws_chunk"`なら新設の`handleResearchDrawsChunk_`へ、それ以外(無指定 or `"experiment"`)は従来通り`handleExperiment_`へルーティングします。`request_type`が無い旧POST・`request_type: "experiment"`の新v3 envelope(`{request_type, schema_version, payload}`)の両方に対応します。
+- `doPost`の先頭で`request_type`を見て、`"research_draws_chunk"`なら新設の`handleResearchDrawsChunk_`へ、`"experiment"`ならv3厳格validation(上記2節)を経て`handleExperiment_`へ、`request_type`が無い旧POSTはvalidationなしでそのまま`handleExperiment_`へルーティングします。
 - `EXPERIMENT_V3_COLUMNS`は`docs/apps_script_v3_spec.md`の候補列から、実際には存在しない2列(`coin_cost_model_version`・`draw_detail_schema_version`。ResearchDraws側の列であり、Experimentsの列ではない)を除外し、`initial_coin`を実際のフィールド名`coin_initial`に修正しています(この修正は`docs/apps_script_v3_spec.md`側にも反映済みです)。
 - ResearchDrawsの書き込みにも`safeValue_`を適用しています(旧リファレンス実装では未適用でした)。
 

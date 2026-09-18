@@ -67,6 +67,56 @@ interface ResumeOffsets {
   coinRemaining: number;
 }
 
+// resume時のoffset決定ロジック(指示1節D項)を、hookの外側で単体テスト・見通しよく保てるよう
+// 純粋関数として切り出す。優先順位は必ずこの順で決まる:
+//   1. IndexedDBのlastDrawが読めればそれを正本として使う(読めて0件=nullも「0件」として正)
+//   2. IndexedDBの読み取り自体が失敗した場合のみ、localStorageのcheckpointへfallbackする
+//   3. どちらも無ければ0から
+// 「読めたが0件」を「読み取り失敗」と混同しない(無言で0扱いにしない)。
+function buildResumeOffsets(
+  snapshot: ActiveExperimentSnapshot,
+  lastDraw: researchDrawsDb.ResearchDrawRecord | null,
+  indexedDbReadFailed: boolean
+): ResumeOffsets {
+  const pauseCount = snapshot.pause_count ?? 0;
+  const pausedDurationMs = snapshot.paused_duration_ms ?? 0;
+  const resumeCount = (snapshot.resume_count ?? 0) + 1;
+
+  if (lastDraw) {
+    return {
+      rollOffset: lastDraw.draw_index,
+      batchOffset: lastDraw.batch_index,
+      activeMsBase: lastDraw.active_elapsed_ms,
+      coinRemaining: lastDraw.coin_remaining_after_draw ?? INITIAL_COIN,
+      pauseCount,
+      pausedDurationMs,
+      resumeCount,
+    };
+  }
+
+  if (indexedDbReadFailed && snapshot.checkpoint_draw_index !== undefined) {
+    return {
+      rollOffset: snapshot.checkpoint_draw_index ?? 0,
+      batchOffset: snapshot.checkpoint_batch_index ?? 0,
+      activeMsBase: snapshot.checkpoint_active_elapsed_ms ?? 0,
+      coinRemaining: snapshot.checkpoint_coin_remaining ?? INITIAL_COIN,
+      pauseCount,
+      pausedDurationMs,
+      resumeCount,
+    };
+  }
+
+  return {
+    rollOffset: 0,
+    batchOffset: 0,
+    activeMsBase: 0,
+    coinRemaining: INITIAL_COIN,
+    pauseCount,
+    pausedDurationMs,
+    resumeCount,
+  };
+}
+
 // 研究モードのExperiment Flow(画面遷移・累計roll_count・survey gating)は、
 // Core(app/core/src/state/researchModeState.js)がすでに実装済みのため、それをそのまま使う。
 // このhookはCoreセッションのReact向けラッパーと、実験結果のlocalStorage保存(researchHistory.ts)
@@ -100,6 +150,9 @@ export function useResearchSession() {
   //  useCallback内のisRevealing state closureはstale化しうるため、refで保証する。)
   const isRevealingRef = useRef(false);
   const [saveError, setSaveError] = useState<string | null>(null);
+  // ResearchDraws(IndexedDB)への保存に失敗した場合の表示用エラー(指示1節E項)。
+  // 研究データの欠損を黙って握りつぶさず、UIへ明示する。次のrevealBatch開始時にリセットされる。
+  const [researchDrawsSaveError, setResearchDrawsSaveError] = useState<string | null>(null);
   const [finalRecord, setFinalRecord] = useState<ResearchExperiment | null>(null);
   const finalRecordRef = useRef<ResearchExperiment | null>(null);
   useEffect(() => {
@@ -144,6 +197,17 @@ export function useResearchSession() {
   const activeMsBaseRef = useRef(0);
   const activeAccumulatedRef = useRef(0);
   const activePeriodStartRef = useRef<number | null>(null);
+
+  // resume用のcheckpoint(指示1節B・C項)。ResearchDraws(IndexedDB)へのappendDraw()が
+  // 成功したdrawについてのみ更新する「確定済み」の値であり、localStorageのActiveExperimentSnapshotへ
+  // そのまま書き出される。ResearchDrawsを正本とする既存方針は変えず、これはIndexedDB読み取り
+  // 失敗時だけのfallback/cacheという位置づけ(buildResumeOffsets参照)。
+  const checkpointRef = useRef({
+    drawIndex: 0,
+    batchIndex: 0,
+    activeElapsedMs: 0,
+    coinRemaining: INITIAL_COIN,
+  });
 
   const [resumeSnapshot] = useState<ActiveExperimentSnapshot | null>(() => researchStore.loadActiveExperiment());
   const [resumeHandled, setResumeHandled] = useState(false);
@@ -235,10 +299,10 @@ export function useResearchSession() {
   }, [resumedProgressReset]);
 
   // pause_count/paused_duration_ms/resume_count・target_label_snapshotなど、
-  // ResearchDraws(正本)には無いresume用の補助情報だけをlocalStorageへ書き戻す。
-  // roll_offset/batch_offset/active_elapsed_msはResearchDrawsの最終行から復元するため、
-  // ここには含めない。target_label_snapshotは実験開始時点で確定済みの値をそのまま運ぶだけで、
-  // ここで再計算はしない(指示1節)。
+  // ResearchDraws(正本)には無いresume用の補助情報に加え、checkpointRef(直近の
+  // 確定済みdraw_index/batch_index/active_elapsed_ms/coin_remaining)もfallback用として書き戻す。
+  // ResearchDraws(IndexedDB)を正本とする既存方針は変えない(指示1節C項: あくまでfallback/cache)。
+  // target_label_snapshotは実験開始時点で確定済みの値をそのまま運ぶだけで、ここで再計算はしない。
   function persistActiveSnapshot() {
     const meta = metaRef.current;
     if (!meta) return;
@@ -257,6 +321,10 @@ export function useResearchSession() {
       pause_count: pauseCountRef.current,
       paused_duration_ms: pausedDurationMsRef.current,
       resume_count: resumeCountRef.current,
+      checkpoint_draw_index: checkpointRef.current.drawIndex,
+      checkpoint_batch_index: checkpointRef.current.batchIndex,
+      checkpoint_active_elapsed_ms: checkpointRef.current.activeElapsedMs,
+      checkpoint_coin_remaining: checkpointRef.current.coinRemaining,
     });
   }
 
@@ -309,6 +377,14 @@ export function useResearchSession() {
     activeAccumulatedRef.current = 0;
     activePeriodStartRef.current = null;
 
+    checkpointRef.current = {
+      drawIndex: rollOffset,
+      batchIndex: batchOffset,
+      activeElapsedMs: resumeOffsets?.activeMsBase ?? 0,
+      coinRemaining: resumeOffsets?.coinRemaining ?? INITIAL_COIN,
+    };
+    setResearchDrawsSaveError(null);
+
     pauseCountRef.current = resumeOffsets?.pauseCount ?? 0;
     pausedDurationMsRef.current = resumeOffsets?.pausedDurationMs ?? 0;
     resumeCountRef.current = resumeOffsets?.resumeCount ?? 0;
@@ -357,24 +433,16 @@ export function useResearchSession() {
     const target = storedTargetToTarget(dataset.datasetId, resumeSnapshot.target);
 
     let lastDraw: researchDrawsDb.ResearchDrawRecord | null = null;
+    let indexedDbReadFailed = false;
     try {
       lastDraw = await researchDrawsDb.getLastDrawForExperiment(resumeSnapshot.experiment_id);
     } catch {
-      // IndexedDBが読めない場合でも「0件からの再開」として続行できるようにする
-      // (研究データの継続収集を、ストレージ不調で完全に止めないためのfail-soft)。
-      lastDraw = null;
+      // IndexedDB自体が読めない場合のみ、localStorageのcheckpointへfallbackする
+      // (buildResumeOffsets参照)。読み取りに成功して0件だった場合と区別する(無言で0扱いにしない)。
+      indexedDbReadFailed = true;
     }
 
-    const resumeOffsets: ResumeOffsets = {
-      rollOffset: lastDraw?.draw_index ?? 0,
-      batchOffset: lastDraw?.batch_index ?? 0,
-      activeMsBase: lastDraw?.active_elapsed_ms ?? 0,
-      pauseCount: resumeSnapshot.pause_count ?? 0,
-      pausedDurationMs: resumeSnapshot.paused_duration_ms ?? 0,
-      resumeCount: (resumeSnapshot.resume_count ?? 0) + 1,
-      // ResearchDraws最終行のcoin_remaining_after_drawを正本として復元する(未記録ならINITIAL_COIN)。
-      coinRemaining: lastDraw?.coin_remaining_after_draw ?? INITIAL_COIN,
-    };
+    const resumeOffsets = buildResumeOffsets(resumeSnapshot, lastDraw, indexedDbReadFailed);
 
     beginSession(
       dataset,
@@ -418,6 +486,7 @@ export function useResearchSession() {
     isRevealingRef.current = true;
     setIsRevealing(true);
     setCurrentBatchRevealed([]);
+    setResearchDrawsSaveError(null); // 前回の保存失敗表示があれば、新しいバッチ開始時にリセットする
     const revealedThisBatch: RevealedEntry[] = [];
 
     for (let i = 0; i < 10; i++) {
@@ -425,10 +494,6 @@ export function useResearchSession() {
       if (session.phase !== ResearchModePhases.RUNNING) break;
       const { gem, rollCount: relativeRollCount, matched } = session.revealNext();
       const absoluteRollCount = meta.rollOffset + relativeRollCount;
-      const entry: RevealedEntry = { gem, rollCount: absoluteRollCount, matched };
-      revealedThisBatch.push(entry);
-      setCurrentBatchRevealed([...revealedThisBatch]);
-      setRollCount(absoluteRollCount);
 
       const activeElapsedMs = getActiveMsNow();
       const wallElapsedMs = Date.now() - meta.startedAtMs;
@@ -440,11 +505,15 @@ export function useResearchSession() {
       // coin(有限resource/cost体験)を消費する。確定したproduction設定(COIN_COST_OPTIONS)を
       // 唯一の定義元として参照し、ここへ式やパラメータをハードコードしない。
       const coinCost = computeNormalizedSurprisalCost(gemProbabilityExact, meta.datasetEntropyBits, COIN_COST_OPTIONS);
-      coinRemainingRef.current -= coinCost;
-      setCoinRemaining(Math.max(0, coinRemainingRef.current));
+      const coinRemainingAfterThisDraw = coinRemainingRef.current - coinCost;
 
-      void researchDrawsDb
-        .appendDraw({
+      // 指示1節A項: このdrawを「resume可能な確定済みdraw」として扱う前に、IndexedDBへの
+      // 書き込み成功を保証する(fire-and-forgetにしない)。書き込みが確認できるまでは
+      // UI状態(currentBatchRevealed/rollCount/coinRemaining)もcheckpointも進めない。
+      let saved = true;
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        await researchDrawsDb.appendDraw({
           experiment_id: meta.experimentId,
           draw_index: absoluteRollCount,
           batch_index: batchIndex,
@@ -461,15 +530,44 @@ export function useResearchSession() {
           gem_probability_exact: gemProbabilityExact,
           gem_surprisal_bits: gemSurprisalBits,
           coin_cost: coinCost,
-          coin_remaining_after_draw: coinRemainingRef.current,
+          coin_remaining_after_draw: coinRemainingAfterThisDraw,
           coin_cost_model_version: COIN_COST_MODEL_VERSION,
           draw_detail_schema_version: DRAW_DETAIL_SCHEMA_VERSION,
-        })
-        .catch(() => {
-          // IndexedDB書き込み失敗はUIをクラッシュさせない(fail-soft)。
-          // resumeのroll_offsetがこの1件分ずれる可能性はあるが、実験の続行自体は妨げない。
         });
-      persistActiveSnapshot(); // pause関連の補助情報をこまめにcheckpointする
+      } catch {
+        saved = false;
+      }
+
+      if (!saved) {
+        // 指示1節E項: 研究データの欠損を黙って握りつぶさない。UIへ保存失敗を表示し、
+        // このdraw以降を正常保存済みとして扱わない(checkpoint/coin/表示のいずれも進めずここで停止)。
+        // このdraw自体はCore内部では既にrevealNext()済み(乱数消費)だが、確定保存できなかった
+        // ため参加者へは見せない。draw_indexの欠番はAnalysis時にdraw_detail_countとの
+        // 突き合わせで検知できる(Experiments/ResearchDrawsの完全性判定は既存方針のまま)。
+        setResearchDrawsSaveError(
+          "研究データの保存に失敗しました。この試行は記録されていません。ページを閉じずに、もう一度「次の10連」をお試しください。"
+        );
+        stopRequestedRef.current = true;
+        break;
+      }
+
+      coinRemainingRef.current = coinRemainingAfterThisDraw;
+      setCoinRemaining(Math.max(0, coinRemainingRef.current));
+
+      const entry: RevealedEntry = { gem, rollCount: absoluteRollCount, matched };
+      revealedThisBatch.push(entry);
+      setCurrentBatchRevealed([...revealedThisBatch]);
+      setRollCount(absoluteRollCount);
+
+      // 指示1節C・F項: 保存成功が確認できたdrawについてのみcheckpointを進める
+      // (roll_count/batch_index/active_elapsed_ms/coin_remainingをすべて整合させて更新する)。
+      checkpointRef.current = {
+        drawIndex: absoluteRollCount,
+        batchIndex,
+        activeElapsedMs,
+        coinRemaining: coinRemainingRef.current,
+      };
+      persistActiveSnapshot();
 
       if (matched) break; // Target Match: ここで停止し、残りは参加者に見せない(roll_countも増やさない)。coin exhaustionより優先する。
       if (coinRemainingRef.current <= 0) {
@@ -722,6 +820,7 @@ export function useResearchSession() {
     activeAccumulatedRef.current = 0;
     activePeriodStartRef.current = null;
     coinRemainingRef.current = INITIAL_COIN;
+    checkpointRef.current = { drawIndex: 0, batchIndex: 0, activeElapsedMs: 0, coinRemaining: INITIAL_COIN };
     setPhase("idle");
     setRollCount(0);
     setCurrentBatchRevealed([]);
@@ -735,6 +834,7 @@ export function useResearchSession() {
     setAutoRemainingMs(0);
     setIsAutoPaused(false);
     setCoinRemaining(INITIAL_COIN);
+    setResearchDrawsSaveError(null);
     pauseCountRef.current = 0;
     pausedDurationMsRef.current = 0;
     resumeCountRef.current = 0;
@@ -757,6 +857,8 @@ export function useResearchSession() {
     elapsedMs,
     resumedProgressReset,
     isRetiring,
+    // ResearchDraws(IndexedDB)への保存に失敗した場合のエラー表示(指示1節E項)。
+    researchDrawsSaveError,
     startExperiment,
     revealBatch,
     giveUp,

@@ -165,6 +165,21 @@ ResearchDraws受信時は最低限、処理件数を返す:
 
 ---
 
+## 9. Experiment payloadの必須key検証(本収集開始前の完全性修正)
+
+本番Sheetで、`experiment_id`/`submission_status`/`submitted_at`のみが埋まり他のフィールドが空欄という不完全な行が複数発生していたことへの対応。原因は、旧`Code.gs`が`experiment_id`さえあれば他のfieldの欠落を許容し、空欄のままsent扱いで書き込んでいたため。
+
+1. **`request_type: "experiment"`のv3 envelopeのみ、書き込み前に必須keyの存在を厳格に検証する。** 必須key一覧は`apps_script/Code.gs`の`EXPERIMENT_REQUIRED_KEYS`(34key)を正とする。「keyが存在しない」ことと「値がnull」であることを区別し、nullable fieldはnullでよいが、key自体の欠落は許容しない。
+2. **1つでも欠落していれば、Sheetへ1セルも書き込まず**、`{ok:false, error:"experiment_validation_failed", missing_fields:[...]}`を返す。
+3. **`request_type`が無いlegacy POST(既存pilot dataを送っていた旧クライアント)には、この厳格validationを適用しない。** 後方互換のため、従来どおり`experiment_id`の存在のみを必須とする。
+4. **既存Sheetsの行(不完全な空行を含む)は変更・削除・backfillしない。** 今回の修正は新規POSTの受け付け時にのみ適用され、過去に書き込まれた不完全な行はpilot/incompleteなデータとしてそのまま残す(`docs/handoff.md`参照)。
+5. **ResearchDraws側にも合わせて以下を追加する**(3・4節の既存方針を補強するもの):
+   - chunk sizeが上限(500件)を超えたら`chunk_too_large`として拒否する。
+   - `body.experiment_id`と各`draw.experiment_id`が一致しないrowは不正として扱い、chunk全体を失敗させる。
+   - `draw_index`は正の整数であることを検証する(単なる数値型チェックだけでは不十分だったため)。
+
+---
+
 ## 現物確認済みの前提(2026-09-18時点、`docs/handoff.md`と重複するが再掲)
 
 - 現行`Code.gs`はExperiments専用の`doPost`のみで、`experiment_id`でdedupeして1行書き込む構造。
